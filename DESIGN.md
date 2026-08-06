@@ -338,7 +338,7 @@ converter.go      Converter, DefaultConverter, record shape
 attr.go           attribute/group/ReplaceAttr helpers (original, see §9)
 errors.go         StatusError, DropError, ErrClosed, OnError plumbing
 version.go        ReadBuildInfo
-example/          runnable example, no time.Sleep                      (v0.3)
+example/          runnable example, no time.Sleep
 ```
 
 **[amended]** Marked the entries §10 defers, since this table is what someone implements from; the v0.2 markers are cleared now that those landed. Note also that gzip lives in `client.go`'s `packer`, driven by the sender, not in `transport.go` — see §3. `sender.go` was split out of `client.go` during implementation, which the original table did not anticipate.
@@ -372,6 +372,6 @@ The greenfield rewrite only buys clean licensing if no source is copied.
 
 **v0.2 — parity.** 413 splitting, `ExtraFields`, send-time filter, dry-run, separate connect/request timeouts, JSON-array encoder, README with the full options table. **[amended]** Also `WithRetryCeiling`, which §5 assigned here without §10 listing it. Separate connect/request timeouts in fact shipped in v0.1, with the transport.
 
-**v0.3 — polish.** MessagePack, burst protection, mirroring to a second `slog.Handler`, benchmarks, `example/` covering context extraction and graceful shutdown.
+**v0.3 — polish.** MessagePack, burst protection, mirroring to a second `slog.Handler`, `example/` covering context extraction and graceful shutdown — the example has landed, the other three have not. **[amended]** Benchmarks were listed here but shipped with v0.1: `bench_test.go` covers `Handle` (bare, attrs, groups, source, error, disabled, parallel), `Enqueue`, `AppendRecord`, batch assembly, `compress` and `Flush`. Same case as v0.2's connect/request timeouts — an item ticked before the milestone that claimed it.
 
 Open questions for Better Stack, none blocking: the `context` vs `extra` key, whether library identity belongs in the payload or only in `User-Agent`, and confirmation that undocumented `Content-Encoding: gzip` is contractual rather than incidental.

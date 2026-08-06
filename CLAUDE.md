@@ -20,7 +20,7 @@ Sections of DESIGN.md marked **[amended]** were corrected during implementation,
 
 **v0.2 is complete**: 413 batch splitting (and the local hard-limit check splits too), `WithExtraFields`, `WithFilter`, `WithDryRun`, `WithRetryCeiling`, the `JSONArray` encoder, and `README.md`. "Separate connect/request timeouts", listed under v0.2 in DESIGN §10, had in fact shipped with v0.1's transport. `Encoder.AppendRecord` lost its `index` parameter — see DESIGN §4's amendment before reinstating it.
 
-Next milestone, not started: **v0.3** — MessagePack, burst protection, mirroring to a second `slog.Handler`, `example/`.
+**v0.3 is in progress.** `example/` has landed — a runnable HTTP service demonstrating context extraction and graceful shutdown, verified against a local sink. Still to do: MessagePack, burst protection, mirroring to a second `slog.Handler`. Benchmarks were listed under v0.3 but shipped with v0.1; DESIGN §10 records that.
 
 ## Commands
 
@@ -74,7 +74,7 @@ Each of these was arrived at the hard way, and several have a test whose only jo
 - **`slogtest.TestHandler`, not `slogtest.Run`** — `Run` is Go 1.22. The results mapper in `handler_test.go` remaps `dt`→`time` and `message`→`msg` and hoists `context.*`, which `TestHandler`'s own docs bless.
 - **Non-flakiness rules**, applied throughout: never `time.Sleep` to wait for a result (`waitFor` polls at 1 ms, fails at 2 s); `Sleep` only to prove a negative; timing assertions are one-sided **lower** bounds only, since full jitter can make any backoff near zero; every deterministic test sets `WithBatchInterval(time.Hour)` so only the trigger under test can fire; `t.Parallel()` everywhere with a per-test client and server.
 - **Always close the client before the server.** `httptest.Server.Close` waits for outstanding requests, and a client still retrying into it will deadlock the cleanup. A gated recorder needs `rec.release()` before `c.Close()`.
-- Coverage is ~94%. When adding a feature, check the new code is actually reached — `reportDrops` sat at 0% because its path is gated behind a five-second interval.
+- Coverage is ~93%. When adding a feature, check the new code is actually reached — `reportDrops` sat at 0% because its path is gated behind a five-second interval. The standing uncovered remainder is the gzip-failure branches in `split`/`pack`/`splitAndSend`, which need a seam to inject a broken writer; that is why `compress` sits at 71.4%.
 
 ## Provenance — this constrains what you may write
 
@@ -87,5 +87,7 @@ The greenfield rewrite only buys clean licensing if no source is copied. `samber
 ## Repository conventions
 
 - **The exported API is not frozen**, but it is close to it. This is a new module with its own v0, so breaking changes are cheap now and expensive after the first tag. Decide API shape before tagging v0.1.
-- No CI, no Makefile, no `example/` yet — a deliberate scope choice, not an oversight. `example/` is scheduled for v0.3.
+- No CI and no Makefile — a deliberate scope choice, not an oversight.
+- **`example/` is `package main` inside this module**, so `go build ./...` and `go vet ./...` cover it and it cannot rot. It therefore lives under the same Go 1.21 floor as the library: no `for range int`, no method patterns in `http.ServeMux` (`"GET /x"` is 1.22), nothing else `stdversion` would catch.
+- The example must stay runnable with no credentials. `go run ./example` falls back to dry run; `-endpoint` points it at a local sink, which is how its wire output was verified.
 - No git remote is configured.

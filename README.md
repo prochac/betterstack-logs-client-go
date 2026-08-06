@@ -199,6 +199,27 @@ Everything runs — conversion, encoding, batching, framing, compression, `Flush
 dry-run client needs no source token, since not having one is the point.
 Everything else is validated exactly as usual.
 
+## Example
+
+[`example/`](./example) is a small HTTP service that puts the pieces together:
+context extraction, extra fields, a filter, and a shutdown that closes the
+client last so the records produced while draining are not lost.
+
+```sh
+go run ./example
+```
+
+It needs no credentials — with no `BETTERSTACK_SOURCE_TOKEN` it runs in dry-run
+mode. To see what actually goes on the wire without an account, point it at any
+local HTTP server:
+
+```sh
+go run ./example -endpoint http://localhost:9999
+```
+
+It drives a few requests against itself at startup, then serves until Ctrl-C and
+prints the `Stats` balance on the way out.
+
 ## Documentation
 
 [`DESIGN.md`](./DESIGN.md) is the specification: every option and its default,
