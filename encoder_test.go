@@ -20,7 +20,7 @@ func TestNDJSONAppendRecordIsOneLine(t *testing.T) {
 	t.Parallel()
 	enc := NDJSON()
 
-	got, err := enc.AppendRecord(nil, 0, map[string]any{"message": "hello"})
+	got, err := enc.AppendRecord(nil, map[string]any{"message": "hello"})
 	if err != nil {
 		t.Fatalf("AppendRecord: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestNDJSONAppendRecordAccumulates(t *testing.T) {
 	var buf []byte
 	var err error
 	for i := 0; i < 3; i++ {
-		buf, err = enc.AppendRecord(buf, i, map[string]any{"i": i})
+		buf, err = enc.AppendRecord(buf, map[string]any{"i": i})
 		if err != nil {
 			t.Fatalf("AppendRecord(%d): %v", i, err)
 		}
@@ -75,7 +75,7 @@ func TestNDJSONAppendRecordPreservesPrefix(t *testing.T) {
 	t.Parallel()
 	prefix := []byte("PREFIX\n")
 
-	got, err := NDJSON().AppendRecord(prefix, 0, map[string]any{"a": 1})
+	got, err := NDJSON().AppendRecord(prefix, map[string]any{"a": 1})
 	if err != nil {
 		t.Fatalf("AppendRecord: %v", err)
 	}
@@ -91,13 +91,13 @@ func TestNDJSONAppendRecordErrorLeavesDstIntact(t *testing.T) {
 	t.Parallel()
 	enc := NDJSON()
 
-	dst, err := enc.AppendRecord(nil, 0, map[string]any{"ok": true})
+	dst, err := enc.AppendRecord(nil, map[string]any{"ok": true})
 	if err != nil {
 		t.Fatalf("AppendRecord: %v", err)
 	}
 	before := append([]byte(nil), dst...)
 
-	got, err := enc.AppendRecord(dst, 1, map[string]any{"bad": math.NaN()})
+	got, err := enc.AppendRecord(dst, map[string]any{"bad": math.NaN()})
 	if err == nil {
 		t.Fatal("AppendRecord(NaN) = nil error, want an error")
 	}
@@ -113,7 +113,7 @@ func TestNDJSONDoesNotEscapeHTML(t *testing.T) {
 	t.Parallel()
 	const msg = `GET /a?x=1&y=2 took <500ms>`
 
-	got, err := NDJSON().AppendRecord(nil, 0, map[string]any{"message": msg})
+	got, err := NDJSON().AppendRecord(nil, map[string]any{"message": msg})
 	if err != nil {
 		t.Fatalf("AppendRecord: %v", err)
 	}
@@ -148,6 +148,145 @@ func TestNDJSONFrameIsIdentity(t *testing.T) {
 	}
 }
 
+// --- JSON array -------------------------------------------------------------
+
+func TestJSONArrayContentType(t *testing.T) {
+	t.Parallel()
+	if got, want := JSONArray().ContentType(), "application/json"; got != want {
+		t.Errorf("ContentType() = %q, want %q", got, want)
+	}
+}
+
+// The framing contract: records carry a leading comma, and Frame turns the
+// first of them into the opening bracket.
+func TestJSONArrayFrames(t *testing.T) {
+	t.Parallel()
+	enc := JSONArray()
+
+	for _, n := range []int{1, 2, 5} {
+		var buf []byte
+		for i := 0; i < n; i++ {
+			var err error
+			if buf, err = enc.AppendRecord(buf, map[string]any{"i": i}); err != nil {
+				t.Fatalf("AppendRecord(%d): %v", i, err)
+			}
+		}
+		body := enc.Frame(buf, n)
+
+		var decoded []map[string]any
+		if err := json.Unmarshal(body, &decoded); err != nil {
+			t.Fatalf("n=%d: not a JSON array: %v (%q)", n, err, body)
+		}
+		if len(decoded) != n {
+			t.Fatalf("n=%d: decoded %d records: %q", n, len(decoded), body)
+		}
+		for i, m := range decoded {
+			if m["i"] != float64(i) {
+				t.Errorf("n=%d: record %d = %v, want i=%d", n, i, m, i)
+			}
+		}
+	}
+}
+
+// Records are encoded one at a time and never learn their position, so any
+// contiguous run of them must frame into a valid array on its own. That is what
+// lets an oversized batch be split without re-encoding anything.
+func TestJSONArrayFramesAnySubrun(t *testing.T) {
+	t.Parallel()
+	enc := JSONArray()
+
+	const total = 6
+	var buf []byte
+	bounds := make([]int, 0, total)
+	for i := 0; i < total; i++ {
+		var err error
+		if buf, err = enc.AppendRecord(buf, map[string]any{"i": i}); err != nil {
+			t.Fatalf("AppendRecord(%d): %v", i, err)
+		}
+		bounds = append(bounds, len(buf))
+	}
+
+	for from := 0; from < total; from++ {
+		for to := from + 1; to <= total; to++ {
+			lo := 0
+			if from > 0 {
+				lo = bounds[from-1]
+			}
+			// A copy, because Frame writes into the buffer it is given.
+			run := append([]byte(nil), buf[lo:bounds[to-1]]...)
+			body := enc.Frame(run, to-from)
+
+			var decoded []map[string]any
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				t.Fatalf("records [%d,%d) do not frame: %v (%q)", from, to, err, body)
+			}
+			if len(decoded) != to-from {
+				t.Fatalf("records [%d,%d): decoded %d", from, to, len(decoded))
+			}
+			if decoded[0]["i"] != float64(from) {
+				t.Errorf("records [%d,%d): first is %v, want i=%d", from, to, decoded[0], from)
+			}
+		}
+	}
+}
+
+func TestJSONArrayFrameEmpty(t *testing.T) {
+	t.Parallel()
+	if got := string(JSONArray().Frame(nil, 0)); got != "[]" {
+		t.Errorf("Frame(nil, 0) = %q, want %q", got, "[]")
+	}
+}
+
+// A record must contribute exactly its own bytes: the batch byte cap is
+// measured on the accumulated buffer, so a stray newline per record would make
+// the accounting drift.
+func TestJSONArrayRecordHasNoTrailingNewline(t *testing.T) {
+	t.Parallel()
+
+	got, err := JSONArray().AppendRecord(nil, map[string]any{"a": 1})
+	if err != nil {
+		t.Fatalf("AppendRecord: %v", err)
+	}
+	if bytes.ContainsRune(got, '\n') {
+		t.Errorf("record contains a newline: %q", got)
+	}
+	if got[0] != ',' {
+		t.Errorf("record does not begin with a comma: %q", got)
+	}
+}
+
+func TestJSONArrayAppendRecordErrorLeavesDstIntact(t *testing.T) {
+	t.Parallel()
+	enc := JSONArray()
+
+	dst, err := enc.AppendRecord(nil, map[string]any{"ok": true})
+	if err != nil {
+		t.Fatalf("AppendRecord: %v", err)
+	}
+	before := append([]byte(nil), dst...)
+
+	got, err := enc.AppendRecord(dst, map[string]any{"bad": math.NaN()})
+	if err == nil {
+		t.Fatal("AppendRecord(NaN) = nil error, want an error")
+	}
+	if !bytes.Equal(got, before) {
+		t.Errorf("dst was modified on error:\n got %q\nwant %q", got, before)
+	}
+}
+
+func TestJSONArrayDoesNotEscapeHTML(t *testing.T) {
+	t.Parallel()
+	const msg = `GET /a?x=1&y=2 took <500ms>`
+
+	got, err := JSONArray().AppendRecord(nil, map[string]any{"message": msg})
+	if err != nil {
+		t.Fatalf("AppendRecord: %v", err)
+	}
+	if strings.Contains(string(got), `\u00`) {
+		t.Errorf("output contains a unicode escape: %q", got)
+	}
+}
+
 // One Encoder is shared by every goroutine calling Enqueue, so the pooled
 // scratch buffer must not leak between them.
 func TestNDJSONConcurrentUse(t *testing.T) {
@@ -161,7 +300,7 @@ func TestNDJSONConcurrentUse(t *testing.T) {
 		go func(g int) {
 			defer wg.Done()
 			for i := 0; i < perGoroutine; i++ {
-				got, err := enc.AppendRecord(nil, i, map[string]any{"g": g})
+				got, err := enc.AppendRecord(nil, map[string]any{"g": g})
 				if err != nil {
 					t.Errorf("AppendRecord: %v", err)
 					return

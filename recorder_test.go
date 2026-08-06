@@ -32,6 +32,7 @@ type recorder struct {
 	delay    time.Duration
 	gate     chan struct{} // when non-nil, handlers block on it
 	newConns int
+	maxBytes int // when > 0, a larger decompressed body gets a 413
 }
 
 type recordedRequest struct {
@@ -39,6 +40,7 @@ type recordedRequest struct {
 	body    []byte // decompressed
 	lines   [][]byte
 	records []map[string]any
+	status  int // what the recorder answered
 	at      time.Time
 }
 
@@ -67,6 +69,18 @@ func withDelay(d time.Duration) recorderOption {
 // client does while uploads are stalled.
 func withGate() recorderOption {
 	return func(r *recorder) { r.gate = make(chan struct{}) }
+}
+
+// withMaxAcceptedBytes makes the server behave like the real one about size: a
+// body over the limit is answered 413, anything else is accepted.
+//
+// This is what drives batch splitting to completion rather than to a fixed
+// number of steps. A scripted 413 tests one split; a size limit tests the loop,
+// because the client has to keep halving until the pieces actually fit, and the
+// test asserts on the outcome — every record delivered — instead of on a
+// request count that encodes the algorithm.
+func withMaxAcceptedBytes(n int) recorderOption {
+	return func(r *recorder) { r.maxBytes = n }
 }
 
 func newRecorder(t *testing.T, opts ...recorderOption) *recorder {
@@ -114,11 +128,16 @@ func (r *recorder) serve(w http.ResponseWriter, req *http.Request) {
 	captured := r.check(req.Header, body)
 
 	r.mu.Lock()
-	r.requests = append(r.requests, captured)
 	status := http.StatusAccepted
-	if len(r.statuses) > 0 {
+	if r.maxBytes > 0 && len(captured.body) > r.maxBytes {
+		// Checked before the script so that a size limit is unconditional, the
+		// way the real endpoint's is.
+		status = http.StatusRequestEntityTooLarge
+	} else if len(r.statuses) > 0 {
 		status, r.statuses = r.statuses[0], r.statuses[1:]
 	}
+	captured.status = status
+	r.requests = append(r.requests, captured)
 	headers := r.headers.Clone()
 	r.mu.Unlock()
 
@@ -160,7 +179,8 @@ func (r *recorder) check(header http.Header, raw []byte) recordedRequest {
 
 	captured := recordedRequest{header: header.Clone(), body: body, at: time.Now()}
 
-	if header.Get("Content-Type") == "application/x-ndjson" {
+	switch header.Get("Content-Type") {
+	case "application/x-ndjson":
 		if len(body) == 0 {
 			r.t.Error("empty NDJSON body")
 		} else if body[len(body)-1] != '\n' {
@@ -174,6 +194,28 @@ func (r *recorder) check(header http.Header, raw []byte) recordedRequest {
 			var m map[string]any
 			if err := json.Unmarshal(line, &m); err != nil {
 				r.t.Errorf("line %d is not valid JSON: %v (%q)", i, err, line)
+				continue
+			}
+			captured.lines = append(captured.lines, line)
+			captured.records = append(captured.records, m)
+		}
+
+	case "application/json":
+		// The framing is assembled a byte at a time from records encoded
+		// separately, so "does it parse as an array of objects" is the whole
+		// contract, and worth checking on every request rather than in one test.
+		var records []map[string]any
+		if err := json.Unmarshal(body, &records); err != nil {
+			r.t.Errorf("body is not a JSON array of objects: %v (%q)", err, body)
+			break
+		}
+		if len(records) == 0 {
+			r.t.Errorf("empty JSON array body: %q", body)
+		}
+		for _, m := range records {
+			line, err := json.Marshal(m)
+			if err != nil {
+				r.t.Errorf("re-marshalling a decoded record: %v", err)
 				continue
 			}
 			captured.lines = append(captured.lines, line)
@@ -205,11 +247,28 @@ func (r *recorder) all() []recordedRequest {
 	return append([]recordedRequest(nil), r.requests...)
 }
 
-// records flattens every record from every request, in arrival order.
+// records flattens every record from every request, in arrival order —
+// including requests the recorder went on to refuse.
 func (r *recorder) records() []map[string]any {
 	var out []map[string]any
 	for _, req := range r.all() {
 		out = append(out, req.records...)
+	}
+	return out
+}
+
+// accepted flattens the records from requests the recorder answered 2xx to.
+//
+// It is the delivered set, and the only one worth asserting exact counts
+// against once retries or batch splitting are in play: a refused request
+// carried its records too, and counting those makes every record look
+// duplicated.
+func (r *recorder) accepted() []map[string]any {
+	var out []map[string]any
+	for _, req := range r.all() {
+		if req.status/100 == 2 {
+			out = append(out, req.records...)
+		}
 	}
 	return out
 }

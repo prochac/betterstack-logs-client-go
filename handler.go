@@ -32,6 +32,8 @@ type handlerConfig struct {
 	addSource       bool
 	replaceAttr     func(groups []string, a slog.Attr) slog.Attr
 	attrFromContext []func(context.Context) []slog.Attr
+	extraFields     map[string]any
+	filter          func(context.Context, slog.Record) bool
 	converter       Converter
 	contextKey      string
 }
@@ -85,6 +87,55 @@ func WithAttrFromContext(extractors ...func(context.Context) []slog.Attr) Handle
 	return func(c *handlerConfig) {
 		c.attrFromContext = append(c.attrFromContext, extractors...)
 	}
+}
+
+// WithExtraFields adds attributes to every record the handler produces —
+// service name, environment, region, the facts that are true of the whole
+// process. It is the Go spelling of the Erlang client's extra_fields and the
+// Java client's appName.
+//
+// They are placed at the root of the attribute tree, so with the default
+// context key they appear inside "context" alongside ordinary attributes, and
+// with WithContextKey("") they flatten to the top level. They are the most
+// general thing said about a record and so yield to everything more specific:
+// an attribute of the same key from the record itself, from a logger's
+// With(...) chain, or from a context extractor wins.
+//
+// logger.With(...) covers much of the same ground. This option differs in
+// applying to every handler derived from this one, whatever With chain it went
+// through, and in being configurable where the client is constructed rather
+// than where the logger is used.
+//
+// The map is copied, so later changes to the caller's map are not observed.
+func WithExtraFields(fields map[string]any) HandlerOption {
+	return func(c *handlerConfig) {
+		if len(fields) == 0 {
+			return
+		}
+		owned := make(map[string]any, len(fields))
+		for k, v := range fields {
+			owned[k] = v
+		}
+		c.extraFields = owned
+	}
+}
+
+// WithFilter sets a predicate deciding, per record, whether it is sent.
+// Returning true sends it. It is the Ruby client's filter_sent_to_better_stack.
+//
+// This is not level filtering: WithLevel answers whether the record is produced
+// at all, and slog skips building one that is not. A filter runs on a record
+// that already exists, with its context and attributes available, so it can ask
+// questions a level cannot — drop health-check logs, sample a noisy path, keep
+// records belonging to a tenant that has not consented.
+//
+// A filtered record is never offered to the client, so it appears nowhere in
+// Stats. It was not dropped; it was never sent for.
+//
+// The predicate runs on the logging goroutine, in the application's critical
+// path, and must be safe for concurrent use. It must not retain the record.
+func WithFilter(f func(context.Context, slog.Record) bool) HandlerOption {
+	return func(c *handlerConfig) { c.filter = f }
 }
 
 // WithConverter replaces the function that builds each record's payload. It is
@@ -147,7 +198,15 @@ func (h *Handler) Enabled(_ context.Context, level slog.Level) bool {
 // reported through the client's OnError callback instead. slog.Logger discards
 // this error, but middleware such as slogmulti.RecoverHandlerError does not, so
 // returning it keeps the handler composable at no cost.
+//
+// A record rejected by WithFilter returns nil without reaching the client.
 func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
+	// Before conversion, so a filtered record costs a predicate call and
+	// nothing else.
+	if h.cfg.filter != nil && !h.cfg.filter(ctx, r) {
+		return nil
+	}
+
 	b := treeBuilder{replace: h.cfg.replaceAttr}
 
 	var source map[string]any
@@ -157,7 +216,7 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 		}
 	}
 
-	attrs := b.build(h.goas, attrsFromContext(ctx, h.cfg.attrFromContext), &r, source)
+	attrs := b.build(h.goas, attrsFromContext(ctx, h.cfg.attrFromContext), &r, source, h.cfg.extraFields)
 	payload := h.cfg.converter(&r, attrs, ConvertOptions{ContextKey: h.cfg.contextKey})
 
 	return h.client.Enqueue(payload)

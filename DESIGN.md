@@ -72,6 +72,7 @@ Separate `ClientOption` and `HandlerOption` types so the compiler enforces which
 | `WithMaxQueueSize(int)` | `100_000` records | Java `maxQueueSize`, drop over |
 | `WithMaxRetries(int)` | `5` | Java |
 | `WithRetryBackoff(time.Duration)` | `300ms` base | Java |
+| `WithRetryCeiling(time.Duration)` | `60s` | total elapsed per batch; OTel `otlploghttp` (§5) |
 | `WithMaxInFlight(int)` | `5` | JS `syncMax` |
 | `WithTimeout(time.Duration)` | `10s` | per request, Java `readTimeout` |
 | `WithConnectTimeout(time.Duration)` | `5s` | Java |
@@ -82,6 +83,8 @@ Separate `ClientOption` and `HandlerOption` types so the compiler enforces which
 | `WithShutdownTimeout(time.Duration)` | `15s` | used by `Close` |
 | `WithDryRun(bool)` | `false` | JS `sendLogsToBetterStack` kill switch |
 
+**[amended]** `WithDryRun(true)` **waives the source-token check** and nothing else. The whole pipeline still runs — convert, encode, queue, batch, frame, compress, `Flush`, `Close` — and the records are counted as `Sent`; only the POST is skipped. Requiring a credential for the one mode whose purpose is not spending one would defeat it, and the mode exists for tests and local development, where there is no token to give. Every other setting is validated exactly as usual, so turning the switch off later cannot surface a configuration error that was hidden while it was on.
+
 ### Handler options and defaults
 
 | Option | Default |
@@ -91,7 +94,17 @@ Separate `ClientOption` and `HandlerOption` types so the compiler enforces which
 | `WithReplaceAttr(func([]string, slog.Attr) slog.Attr)` | nil |
 | `WithAttrFromContext(...func(context.Context) []slog.Attr)` | none |
 | `WithExtraFields(map[string]any)` | none — merged into every record (Erlang `extra_fields`, Java `appName`) |
-| `WithFilter(func(context.Context, slog.Record) bool)` | none — send-time predicate (Ruby `filter_sent_to_better_stack`) |
+| `WithFilter(func(context.Context, slog.Record) bool)` | none — send-time predicate, **true means send** (Ruby `filter_sent_to_better_stack`) |
+
+**[amended]** Extra fields are merged into the **attribute tree**, at its root, not written as top-level payload keys. So with the default context key they appear inside `context`, and `WithContextKey("")` flattens them with everything else. Three consequences, all of which were the reason:
+
+- `Converter` and `ConvertOptions` are untouched. Had they gone in at the top level the converter would have had to place them, and every custom converter would silently drop them.
+- They go through `appendAttr` like any other attribute, so they get the same value mapping (`error` → `{message, type}`, `time.Duration` → string) and the same `ReplaceAttr` treatment, rather than a second, subtly different path for the same job.
+- Precedence falls out of placement: they are applied last and yield to any key already taken, so a record attribute beats a `With(...)` chain attribute beats a context extractor beats an extra field. That is PARITY §3's "applies before any `With` chain" read as *least specific loses*, which is the only reading that stays coherent once groups are involved.
+
+The map is copied at option time; a caller mutating theirs afterwards would otherwise race every `Handle`.
+
+A record rejected by `WithFilter` never reaches `Enqueue`, so it appears nowhere in `Stats`. It was not dropped — it was never sent for. This is distinct from `WithLevel`, which decides whether slog builds a record at all; the filter runs on one that already exists, with its context and attributes available.
 | `WithConverter(Converter)` | `DefaultConverter` |
 | `WithContextKey(string)` | `"context"` — `""` flattens attributes to the top level |
 
@@ -137,6 +150,10 @@ The wait is bounded by a context — the caller's for an explicit `Flush`, the c
 
 **[amended] Compression therefore runs on the sender, before dispatch** — not in `transport.go` on the upload workers, as §7's file layout implies. The reusable-`gzip.Writer` justification above is only true where there is a single writer; with ≤`MaxInFlight` concurrent uploads a shared writer is a data race. Compressing first also shrinks the queued-batch memory bound ~8× and means a retry re-sends bytes rather than recompressing them. Level is `gzip.BestSpeed`: log JSON still compresses 8–12× at level 1, and CPU inside the customer's process is the scarce resource.
 
+**[amended] with one exception: the 413 split path, where a worker compresses with its own writer.** Splitting a rejected batch (§5) means framing and compressing two halves, and it happens on the worker that got the 413 — handing the halves back to the sender would deadlock, since the sender's dispatch blocks on the very pool this worker belongs to. The rule was never "one goroutine compresses"; it was "no `gzip.Writer` is shared". So the buffers move into a `packer` that a single goroutine owns: the sender has one from the start, and each worker builds its own lazily, the first time it actually has to split. Most workers, in most processes, never build one.
+
+**[amended] A batch keeps its records unframed and their boundaries**, alongside the finished body, so that it *can* be split. Neither is recoverable after the fact: the body is framed and compressed, and where one record ends inside it is knowable only to the `Encoder`. Two extra slices and one `int` per record is what that costs in steady state, measured at ~90 bytes per record with no change in allocation count or throughput. The alternative — asking the `Encoder` to re-derive boundaries from a compressed body — would put the hardest possible requirement on the one interface third parties implement.
+
 **[amended] A batch handed to an uploader must own its bytes.** The sender reuses both the accumulation buffer and the gzip output buffer, so it copies (or hands over and reallocates) at dispatch. The fork could pass its reused output buffer straight into a send only because that send was synchronous; with concurrent uploads the same code silently corrupts in-flight request bodies. This is the highest-probability silent-corruption bug in the module.
 
 Concurrent uploads mean batches can land out of order. That is fine: Better Stack orders by `dt`, which the client sets.
@@ -158,14 +175,23 @@ Default body encoding is **NDJSON** (`application/x-ndjson`), a documented Bette
 ```go
 type Encoder interface {
     ContentType() string
-    AppendRecord(dst []byte, index int, v map[string]any) ([]byte, error)
+    AppendRecord(dst []byte, v map[string]any) ([]byte, error)
     Frame(batch []byte, n int) []byte // NDJSON: returns batch unchanged
 }
 ```
 
-**[amended]** `AppendRecord` takes the record's `index` within the batch. Without it the JSON-array encoder that `Frame` exists to accommodate cannot know when to emit a leading comma: a stateful encoder would break reuse across batches, and a `len(dst) > 0` heuristic breaks the moment `dst` carries a prefix. `index` is free for NDJSON and for MessagePack.
+**[amended]** `AppendRecord` does **not** take the record's index within the batch. It did, on the argument that the JSON-array encoder needs one to know when to emit a leading comma — but that argument assumed an encoder driven by a batch assembler, and §3 puts encoding in `Enqueue`, one record at a time, on the caller's goroutine. A record is encoded before it is known which batch it will join or what position it will take, so the index passed was always `0` and could never have been anything else.
 
-`Frame` exists so a JSON-array encoder (`[` … `]`) and, later, MessagePack (array header prefix) fit the same interface without special-casing the sender. `ContentType` travels with the encoder, which is what upstream's bare `Marshaler func(any) ([]byte, error)` option could not express.
+The array encoder does not need it. Every record carries a **leading** comma, and `Frame` overwrites the first one with the opening bracket:
+
+```
+,{"a":1} ,{"b":2} ,{"c":3}      three records, as queued
+[{"a":1} ,{"b":2} ,{"c":3}]     after Frame
+```
+
+One byte written and one appended, whatever the batch size. The real constraint this exposes is stronger than positional framing and is now stated on the interface: **a record's encoding must be self-delimiting and independent of its position**, because the same bytes may be re-framed into a different batch entirely when an oversized one is split (§5). The comma scheme satisfies it for any contiguous run of records; a "comma before every record but the first" scheme would not.
+
+`Frame` exists so a JSON-array encoder (`[` … `]`) and, later, MessagePack (array header prefix) fit the same interface without special-casing the sender. `ContentType` travels with the encoder, which is what upstream's bare `Marshaler func(any) ([]byte, error)` option could not express. The exported constructors are `NDJSON()` and `JSONArray()`.
 
 MessagePack — what the Node transport actually uses — is deferred to a milestone after v0.1. Implementing it in-module keeps the zero-dependency promise; it is a bounded amount of encoder code for the subset of types a log payload contains.
 
@@ -200,17 +226,23 @@ Every response's status is classified — the single most important thing missin
 | Status | Action |
 | --- | --- |
 | `2xx` | done |
-| `413` | **v0.1: terminal** — drop, count `DroppedOversize`, report once naming `WithMaxBatchBytes` as the knob. **v0.2:** split the batch in half and resend both; a single record over the limit is dropped and reported |
+| `413` | **split** the batch in half and resend both, recursively; a single record over the limit is dropped, counted `DroppedOversize`, and reported once naming `WithMaxBatchBytes` as the knob |
 | `401`, `402`, `403`, `406`, other `4xx` | **terminal** — drop the batch, report once. Retrying a bad token burns quota forever |
 | `429`, `5xx`, network/timeout | retry with backoff |
 
 The docs name `403` for a bad token, but the live endpoint answers **`401`** with `{"error": "Unauthorized"}` — verified 2026-08-06 with both a missing and a bogus token, on HTTP/2 and HTTP/1.1. Classifying only the documented codes would leave the single most common misconfiguration in the retry path, so the rule is *terminal by default*: retry only the explicitly retryable set, drop everything else. Auth is also checked before the body is parsed (a bogus token with malformed JSON still returns 401), so `406` is only reachable once the token is valid.
 
-**[amended]** §5's `413` row and §10's milestone split contradicted each other: splitting is a v0.2 item, so v0.1 must not silently retry an over-limit body that is guaranteed to fail again unchanged.
+**[amended]** §5's `413` row and §10's milestone split contradicted each other: splitting was a v0.2 item, so v0.1 could not silently retry an over-limit body that is guaranteed to fail again unchanged. Resolved in v0.2, where splitting landed.
+
+413 stays **out of the retryable set**. Retrying means resending the same bytes, which would fail identically; splitting is a different mechanism that happens to be triggered by the same status. Keeping them separate is what stops "recoverable" from quietly becoming "retryable" for a status where that would be a loop.
+
+**[amended] The local hard-limit check splits too, rather than dropping.** The sender refuses to dispatch a body over the API's documented 10 MiB, to save a request and the retry budget behind it. In v0.1 that was a drop; it is now the same halving, through the same helper, since throwing records away locally that the server would have let us rescue is indefensible. The two paths remain distinct for a reason: `MaxBatchBytes` is measured before compression and the server's limit applies after it, so how much actually fits is not knowable locally — the local check catches the hopeless case, and the 413 catches everything else.
+
+Splitting recurses at most log2(`BatchSize`) deep, and each half restarts its attempt count but **inherits the parent's `RetryCeiling` deadline**, so halving cannot buy a batch more time than the original was granted. The halves are sent one after the other on the worker that got the 413, never handed back to the pool: the pool's dispatch blocks when every worker is busy, and a worker waiting on a pool it occupies is a deadlock.
 
 Retry is exponential from `RetryBackoff` with full jitter, capped at `MaxRetries` and at a total elapsed ceiling. A `Retry-After` header overrides the computed delay — server-supplied backoff wins over local config, OTel's rule (PARITY §6.4) — capped so a hostile header cannot stall shutdown.
 
-**[amended]** `MaxRetries` counts retries **after** the initial attempt, so the default of 5 means at most 6 requests and `WithMaxRetries(0)` means "send once, never retry". This matches Java's `maxRetries` and is stated verbatim in the option's doc comment; it is exactly the sort of off-by-one that otherwise differs silently between clients. The total elapsed ceiling is 60 s (OTel `otlploghttp`'s number), an unexported constant in v0.1 and an option in v0.2. During shutdown it is bounded by the shutdown context rather than by arithmetic: `Close` cancels in-flight uploads when `ShutdownTimeout` expires, so a batch parked in a backoff aborts.
+**[amended]** `MaxRetries` counts retries **after** the initial attempt, so the default of 5 means at most 6 requests and `WithMaxRetries(0)` means "send once, never retry". This matches Java's `maxRetries` and is stated verbatim in the option's doc comment; it is exactly the sort of off-by-one that otherwise differs silently between clients. The total elapsed ceiling is 60 s (OTel `otlploghttp`'s number), an unexported constant in v0.1 and `WithRetryCeiling` from v0.2. It is a second limit alongside `MaxRetries` and the tighter of the two wins, so a generous retry count cannot keep a batch alive against a slow server or a `Retry-After` that keeps asking for more. During shutdown it is bounded by the shutdown context rather than by arithmetic: `Close` cancels in-flight uploads when `ShutdownTimeout` expires, so a batch parked in a backoff aborts.
 
 ### Connection reuse
 
@@ -294,12 +326,13 @@ func (c *Client) Close() error                    // Flush with ShutdownTimeout,
 ```
 go.mod            module github.com/prochac/logs-client-go   (go 1.21)
 LICENSE           ISC, Copyright (c) 2026, Tomáš Procházka
-README.md         install, quickstart, options table, flush-before-exit   (v0.2)
+README.md         install, quickstart, options tables, flush-before-exit
 DESIGN.md         this file
 PARITY.md         research, contract, defaults, gap checklist
-client.go         Client, ClientOption, queue, sender loop, uploadPool, Stats
-transport.go      http.Client, status classification, retry           (413 split: v0.2)
-encoder.go        Encoder, NDJSON                                     (JSON array: v0.2)
+client.go         Client, ClientOption, queue, Stats, batch, packer, gzip
+sender.go         sender goroutine, batch assembly, uploadPool
+transport.go      http.Client, status classification, retry, 413 split
+encoder.go        Encoder, NDJSON, JSONArray
 handler.go        Handler, HandlerOption, slog.Handler implementation
 converter.go      Converter, DefaultConverter, record shape
 attr.go           attribute/group/ReplaceAttr helpers (original, see §9)
@@ -308,7 +341,7 @@ version.go        ReadBuildInfo
 example/          runnable example, no time.Sleep                      (v0.3)
 ```
 
-**[amended]** Marked the entries §10 defers, since this table is what someone implements from. Note also that gzip lives in `client.go`'s sender, not in `transport.go` — see §3.
+**[amended]** Marked the entries §10 defers, since this table is what someone implements from; the v0.2 markers are cleared now that those landed. Note also that gzip lives in `client.go`'s `packer`, driven by the sender, not in `transport.go` — see §3. `sender.go` was split out of `client.go` during implementation, which the original table did not anticipate.
 
 One package. Nothing exported that isn't in §2 plus the types those signatures name.
 
@@ -316,7 +349,7 @@ One package. Nothing exported that isn't in §2 plus the types those signatures 
 
 Real tests are possible from day one because `Flush`/`Close` exist — the current repo has none, and `example/example.go` waits with `time.Sleep`.
 
-- **`httptest.Server` recorder** as the fixture: capture bodies, assert NDJSON framing, headers, gzip round-trip, and payload shape.
+- **`httptest.Server` recorder** as the fixture: capture bodies, assert NDJSON and JSON-array framing, headers, gzip round-trip, and payload shape. **[amended]** It also answers `413` on size, not only to a script. That is what drives splitting to convergence rather than to a fixed number of steps, and it lets the assertions be about the outcome — every record delivered — instead of about a request count that just restates the algorithm. It records the status it gave, since once retries or splitting are in play a refused request carried its records too, and counting those makes every record look duplicated.
 - **Each flush trigger independently**: count, bytes, interval, explicit `Flush`, `Close`.
 - **Failure paths**, which is where the fork's suite stopped: 5xx → retry then success, 403 → terminal with no retry, 413 → split, network error → retry, retry exhaustion → `OnError` + drop counted, queue full → drop counted and `Handle` does not block.
 - **Concurrency**: `-race` with concurrent `Handle` across handlers derived by `WithAttrs`/`WithGroup`, concurrent `Close`, `Handle` after `Close`.
@@ -337,7 +370,7 @@ The greenfield rewrite only buys clean licensing if no source is copied.
 
 **v0.1 — the blockers.** Client + Handler, NDJSON, batching on all three triggers, bounded queue with drop accounting, `Flush`/`Close`, status classification, retry with backoff, connection reuse, `OnError`, `Stats`, gzip. Everything in PARITY §3's blocker list, plus gzip because the 10 MiB limit is measured on compressed bytes. Passes `slogtest`.
 
-**v0.2 — parity.** 413 splitting, `ExtraFields`, send-time filter, dry-run, separate connect/request timeouts, JSON-array encoder, README with the full options table.
+**v0.2 — parity.** 413 splitting, `ExtraFields`, send-time filter, dry-run, separate connect/request timeouts, JSON-array encoder, README with the full options table. **[amended]** Also `WithRetryCeiling`, which §5 assigned here without §10 listing it. Separate connect/request timeouts in fact shipped in v0.1, with the transport.
 
 **v0.3 — polish.** MessagePack, burst protection, mirroring to a second `slog.Handler`, benchmarks, `example/` covering context extraction and graceful shutdown.
 

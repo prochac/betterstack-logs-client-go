@@ -51,6 +51,7 @@ const (
 	defaultTimeout         = 10 * time.Second       // Java readTimeout
 	defaultConnectTimeout  = 5 * time.Second        // Java connectTimeout
 	defaultShutdownTimeout = 15 * time.Second
+	defaultRetryCeiling    = 60 * time.Second // OpenTelemetry otlploghttp
 )
 
 const (
@@ -141,6 +142,7 @@ type clientConfig struct {
 	maxQueueSize    int
 	maxRetries      int
 	retryBackoff    time.Duration
+	retryCeiling    time.Duration
 	maxInFlight     int
 	timeout         time.Duration
 	connectTimeout  time.Duration
@@ -148,6 +150,7 @@ type clientConfig struct {
 	compression     Compression
 	encoder         Encoder
 	onError         func(error)
+	dryRun          bool
 	httpClient      *http.Client // set only by WithHTTPClient
 }
 
@@ -214,6 +217,22 @@ func WithRetryBackoff(d time.Duration) ClientOption {
 	return func(c *clientConfig) { c.retryBackoff = d }
 }
 
+// WithRetryCeiling bounds the total time one batch may spend across all of its
+// attempts, including the waits between them. Default 60s, OpenTelemetry's
+// number for the same job.
+//
+// It is a second limit alongside MaxRetries, and the tighter of the two wins: a
+// generous retry count cannot keep a batch alive indefinitely against a server
+// that answers slowly, or one whose Retry-After keeps asking for more time.
+// Shutdown bounds it further still — Close cancels in-flight uploads when
+// ShutdownTimeout expires, aborting any batch parked in a backoff.
+//
+// A batch split after a 413 keeps its parent's ceiling rather than starting a
+// fresh one, so splitting cannot extend the budget either.
+func WithRetryCeiling(d time.Duration) ClientOption {
+	return func(c *clientConfig) { c.retryCeiling = d }
+}
+
 // WithMaxInFlight caps concurrent uploads. Default 5, matching the JavaScript
 // client's syncMax.
 //
@@ -276,6 +295,21 @@ func WithOnError(f func(error)) ClientOption {
 			c.onError = f
 		}
 	}
+}
+
+// WithDryRun runs the whole pipeline except the request itself.
+//
+// Records are still converted, encoded, queued, batched, framed and compressed,
+// and Flush and Close still behave normally — only the POST is skipped, and the
+// records are counted as Sent. It is the kill switch the JavaScript client
+// spells sendLogsToBetterStack, and it exists so that tests and local
+// development exercise the real code path without spending quota.
+//
+// A dry-run client needs no source token: NewClient("", WithDryRun(true))
+// succeeds, since demanding a credential for the mode whose point is not having
+// one would defeat it. Every other setting is validated exactly as usual.
+func WithDryRun(dry bool) ClientOption {
+	return func(c *clientConfig) { c.dryRun = dry }
 }
 
 // WithHTTPClient supplies the HTTP client used for uploads, replacing the
@@ -356,6 +390,7 @@ func NewClient(sourceToken string, opts ...ClientOption) (*Client, error) {
 		maxQueueSize:    defaultMaxQueueSize,
 		maxRetries:      defaultMaxRetries,
 		retryBackoff:    defaultRetryBackoff,
+		retryCeiling:    defaultRetryCeiling,
 		maxInFlight:     defaultMaxInFlight,
 		timeout:         defaultTimeout,
 		connectTimeout:  defaultConnectTimeout,
@@ -403,7 +438,10 @@ func NewClient(sourceToken string, opts ...ClientOption) (*Client, error) {
 }
 
 func (cfg *clientConfig) validate() error {
-	if strings.TrimSpace(cfg.sourceToken) == "" {
+	// A dry run needs no credential, since not spending one is the point.
+	// Everything below is still checked, so turning the switch off later cannot
+	// surface a configuration error that was hidden while it was on.
+	if !cfg.dryRun && strings.TrimSpace(cfg.sourceToken) == "" {
 		return ErrNoSourceToken
 	}
 	u, err := url.Parse(cfg.endpoint)
@@ -438,6 +476,7 @@ func (cfg *clientConfig) validate() error {
 	}{
 		{"WithBatchInterval", cfg.batchInterval},
 		{"WithTimeout", cfg.timeout},
+		{"WithRetryCeiling", cfg.retryCeiling},
 		{"WithShutdownTimeout", cfg.shutdownTimeout},
 	} {
 		if check.got <= 0 {
@@ -478,7 +517,7 @@ func (c *Client) Enqueue(event map[string]any) error {
 	// therefore synchronous and returnable; byte accounting downstream is exact
 	// and free; and the queue carries []byte, so no record data is shared
 	// between goroutines and there is nothing to alias.
-	buf, err := c.cfg.encoder.AppendRecord(nil, 0, event)
+	buf, err := c.cfg.encoder.AppendRecord(nil, event)
 	if err != nil {
 		return fmt.Errorf("betterstack: encoding record: %w", err)
 	}
@@ -584,11 +623,102 @@ func (c *Client) Close() error {
 func (c *Client) Stats() Stats { return c.stats.snapshot() }
 
 // batch is a completed, framed, optionally compressed request body together
-// with the accounting needed to report on it.
+// with the accounting needed to report on it, and the material needed to split
+// it if the server says it is too big.
 type batch struct {
 	body     []byte // owned by the batch: invariant 3
 	records  int
-	rawBytes int // uncompressed size, for diagnostics
+	rawBytes int // framed, uncompressed size, for diagnostics
+
+	// raw is the concatenated per-record encodings, before framing and before
+	// compression, and bounds[i] is the end offset of record i within it. Two
+	// slices and one integer per record is what a 413 costs in steady state;
+	// the alternative — recovering record boundaries from a compressed, framed
+	// body — is not possible for an arbitrary Encoder.
+	//
+	// Both are owned by the batch, like body. A batch produced by splitting
+	// another aliases its parent's raw, which is sound precisely because the
+	// parent is discarded at that point and nothing ever writes into raw.
+	raw    []byte
+	bounds []int
+}
+
+// split divides b in half by record count. The caller must have checked that b
+// holds at least two records; a single record that is too large cannot be made
+// smaller and is dropped instead.
+//
+// Both halves are re-framed and re-compressed from the original record bytes,
+// which is why raw is kept unframed: the array encoder's opening bracket
+// belongs to the batch, not to the records, so a half cannot simply be a byte
+// range of the parent's body.
+func (p *packer) split(enc Encoder, b *batch) (left, right *batch, err error) {
+	mid := b.records / 2
+	cut := b.bounds[mid-1]
+
+	// The right half's offsets are rebased onto its own slice. b is dead after
+	// this, so rewriting its bounds in place would be safe, but a batch that
+	// quietly corrupts its parent is a poor thing to leave lying around.
+	rightBounds := make([]int, b.records-mid)
+	for i, end := range b.bounds[mid:] {
+		rightBounds[i] = end - cut
+	}
+
+	if left, err = p.pack(enc, b.raw[:cut], b.bounds[:mid]); err != nil {
+		return nil, nil, err
+	}
+	if right, err = p.pack(enc, b.raw[cut:], rightBounds); err != nil {
+		return nil, nil, err
+	}
+	return left, right, nil
+}
+
+// packer turns a run of encoded records into a request body. It owns reusable
+// scratch buffers, so exactly one goroutine may use a given packer: the sender
+// has one, and an upload worker builds its own the first time it has to split a
+// batch. That per-goroutine ownership is what keeps the reused gzip.Writer
+// sound now that compression is no longer confined to the sender.
+type packer struct {
+	scratch []byte      // framing buffer, reused across batches
+	gz      *compressor // nil when compression is off
+}
+
+func newPacker(comp Compression) *packer {
+	p := &packer{}
+	if comp == CompressionGzip {
+		p.gz = newCompressor()
+	}
+	return p
+}
+
+// pack frames, compresses and wraps a run of encoded records into a batch that
+// owns its body.
+//
+// raw must already be owned by the caller on the batch's behalf: it is retained
+// as-is, so that a later split can re-frame from it. Framing happens on the
+// packer's scratch buffer rather than on raw, because Frame may write into the
+// buffer it is given and raw has to survive intact.
+func (p *packer) pack(enc Encoder, raw []byte, bounds []int) (*batch, error) {
+	p.scratch = enc.Frame(append(p.scratch[:0], raw...), len(bounds))
+	framed := p.scratch
+
+	body := framed
+	if p.gz != nil {
+		compressed, err := p.gz.compress(framed)
+		if err != nil {
+			return nil, err
+		}
+		body = compressed
+	}
+	return &batch{
+		// Invariant 3: both the scratch buffer and the compressor's output
+		// buffer are reused, so the batch takes its own copy of whichever one
+		// it ended up with.
+		body:     append([]byte(nil), body...),
+		records:  len(bounds),
+		rawBytes: len(framed),
+		raw:      raw,
+		bounds:   bounds,
+	}, nil
 }
 
 // compressor wraps a reusable gzip.Writer and its output buffer.

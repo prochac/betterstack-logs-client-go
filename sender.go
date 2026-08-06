@@ -16,6 +16,11 @@ type sender struct {
 
 	buf []byte // accumulated encoded records
 	n   int    // records in buf
+	// bounds[i] is the end offset of record i within buf. Recording boundaries
+	// during accumulation is the only chance to learn them cheaply: once the
+	// batch is framed and compressed they are not recoverable for an arbitrary
+	// Encoder, and a 413 needs them to split.
+	bounds []int
 
 	timer *time.Timer
 	// armed is true exactly when the timer is running and its fire value has
@@ -24,7 +29,7 @@ type sender struct {
 	// guesswork.
 	armed bool
 
-	gz *compressor
+	pk *packer
 
 	lastDropReport time.Time
 	reported       dropSnapshot
@@ -35,16 +40,13 @@ type dropSnapshot struct {
 }
 
 func newSender(c *Client) *sender {
-	s := &sender{
+	return &sender{
 		c:              c,
 		buf:            make([]byte, 0, 64<<10),
 		timer:          newStoppedTimer(),
+		pk:             newPacker(c.cfg.compression),
 		lastDropReport: time.Now(),
 	}
-	if c.cfg.compression == CompressionGzip {
-		s.gz = newCompressor()
-	}
-	return s
 }
 
 // newStoppedTimer returns a timer that is stopped with an empty channel.
@@ -134,6 +136,7 @@ func (s *sender) full() bool {
 
 func (s *sender) appendRecord(rec []byte) {
 	s.buf = append(s.buf, rec...)
+	s.bounds = append(s.bounds, len(s.buf))
 	s.n++
 	if s.n == 1 {
 		s.arm()
@@ -172,44 +175,58 @@ func (s *sender) flush(ctx context.Context) {
 	}
 
 	records := s.n
-	body := s.c.cfg.encoder.Frame(s.buf, records)
-	raw := len(body)
-
-	if s.gz != nil {
-		compressed, err := s.gz.compress(body)
-		if err != nil {
-			s.c.report(fmt.Errorf("betterstack: compressing %d record(s): %w", records, err))
-			s.c.stats.droppedRejected.Add(uint64(records))
-			s.reset()
-			return
-		}
-		body = compressed
-	}
-
-	// Invariant 3: both s.buf and the compressor's output buffer are reused, so
-	// the batch takes its own copy before crossing to an upload worker.
-	b := &batch{
-		body:     append([]byte(nil), body...),
-		records:  records,
-		rawBytes: raw,
-	}
+	// The batch owns its records from here on: s.buf and s.bounds are reused
+	// for the next one, and the batch keeps them for a possible split.
+	raw := append([]byte(nil), s.buf...)
+	bounds := append([]int(nil), s.bounds...)
 	s.reset()
 
-	if len(b.body) > hardMaxRequestBytes {
-		// Doomed: the server would reject it. Drop it here with an accurate
-		// count rather than spending a request and a retry budget finding out.
-		s.c.stats.droppedOversize.Add(uint64(b.records))
-		s.c.report(&DropError{Records: b.records, Reason: DropOversize})
-		s.maybeReportDrops()
+	b, err := s.pk.pack(s.c.cfg.encoder, raw, bounds)
+	if err != nil {
+		s.c.report(fmt.Errorf("betterstack: compressing %d record(s): %w", records, err))
+		s.c.stats.droppedRejected.Add(uint64(records))
 		return
 	}
 
-	s.c.pool.dispatch(ctx, b)
+	s.dispatch(ctx, b)
 	s.maybeReportDrops()
+}
+
+// dispatch hands a batch to the upload pool, splitting it first if it is over
+// the API's hard request limit.
+//
+// This is the local counterpart of the server's 413, and it behaves the same
+// way: the batch is halved until the pieces fit rather than thrown away. The
+// two paths matter for different reasons — this one saves a doomed request and
+// the retry budget behind it, while the 413 path catches the case the local
+// check cannot, since MaxBatchBytes is measured before compression and the
+// limit after it.
+func (s *sender) dispatch(ctx context.Context, b *batch) {
+	if len(b.body) <= hardMaxRequestBytes {
+		s.c.pool.dispatch(ctx, b)
+		return
+	}
+
+	if b.records < 2 {
+		// One record, over the limit on its own. Nothing to split.
+		s.c.stats.droppedOversize.Add(1)
+		s.c.report(&DropError{Records: 1, Reason: DropOversize})
+		return
+	}
+
+	left, right, err := s.pk.split(s.c.cfg.encoder, b)
+	if err != nil {
+		s.c.report(fmt.Errorf("betterstack: splitting %d record(s): %w", b.records, err))
+		s.c.stats.droppedRejected.Add(uint64(b.records))
+		return
+	}
+	s.dispatch(ctx, left)
+	s.dispatch(ctx, right)
 }
 
 func (s *sender) reset() {
 	s.buf = s.buf[:0]
+	s.bounds = s.bounds[:0]
 	s.n = 0
 }
 
@@ -299,11 +316,16 @@ func newUploadPool(c *Client) *uploadPool {
 	for i := 0; i < c.cfg.maxInFlight; i++ {
 		go func(seed int64) {
 			defer p.wg.Done()
-			// A per-worker source: no global mutex, and no dependence on
-			// process-global seeding. math/rand/v2 is Go 1.22, out of reach.
-			rnd := rand.New(rand.NewSource(time.Now().UnixNano() ^ seed))
+			// Per-worker state, so nothing here needs a mutex: a private
+			// random source rather than the process-global one (math/rand/v2
+			// is Go 1.22, out of reach), and, once a 413 forces a split, a
+			// private packer.
+			w := &worker{
+				c:   c,
+				rnd: rand.New(rand.NewSource(time.Now().UnixNano() ^ seed)),
+			}
 			for b := range p.jobs {
-				p.complete(c.upload(c.workerCtx, b, rnd))
+				p.complete(w.upload(c.workerCtx, b))
 			}
 		}(int64(i) * 7919)
 	}

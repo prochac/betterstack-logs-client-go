@@ -201,7 +201,10 @@ func TestRetryThenSuccess(t *testing.T) {
 func TestTerminalStatusesAreNotRetried(t *testing.T) {
 	t.Parallel()
 
-	for _, status := range []int{400, 401, 402, 403, 406, 413, 404} {
+	// 413 is absent deliberately: it is terminal in the sense that the same
+	// bytes are never resent, but the records are not abandoned — they go out
+	// as two smaller batches. See TestPayloadTooLargeSplitsTheBatch.
+	for _, status := range []int{400, 401, 402, 403, 406, 404} {
 		status := status
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			t.Parallel()
@@ -237,27 +240,214 @@ func TestTerminalStatusesAreNotRetried(t *testing.T) {
 	}
 }
 
-// 413 is terminal in this milestone — splitting the batch comes later — and the
-// error has to name the knob that fixes it.
-func TestPayloadTooLargeIsTerminalAndCounted(t *testing.T) {
+// A 413 splits the batch and resends both halves. The same bytes are never
+// retried — that would fail identically — but the records are not lost either.
+func TestPayloadTooLargeSplitsTheBatch(t *testing.T) {
 	t.Parallel()
 
+	// Only the first request is refused, so each half is accepted on its own.
 	rec := newRecorder(t, withStatuses(413))
 	c, errs := newTestClient(t, rec, WithBatchSize(1000))
 	defer c.Close()
 
 	enqueueN(t, c, 4)
-	_ = c.Flush(context.Background())
+	if err := c.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 
-	if got := c.Stats().DroppedOversize; got != 4 {
-		t.Errorf("Stats().DroppedOversize = %d, want 4", got)
+	if got := c.Stats().Sent; got != 4 {
+		t.Errorf("Stats().Sent = %d, want 4: the split halves did not all land", got)
+	}
+	if got := c.Stats().DroppedOversize; got != 0 {
+		t.Errorf("Stats().DroppedOversize = %d, want 0: nothing was too large to split", got)
+	}
+	if got := c.Stats().Retries; got != 0 {
+		t.Errorf("Stats().Retries = %d, want 0: a split is not a retry", got)
+	}
+	if got := rec.count(); got != 3 {
+		t.Errorf("got %d requests, want 3 (one refused, two halves)", got)
+	}
+	if got := errs.len(); got != 0 {
+		t.Errorf("OnError fired %d times for a recovered 413: %v", got, errs.all())
+	}
+
+	// Every record must arrive exactly once: splitting must not duplicate the
+	// record on the boundary, nor lose it.
+	seen := map[string]int{}
+	for _, m := range rec.accepted() {
+		seen[m[KeyMessage].(string)]++
+	}
+	if len(seen) != 4 {
+		t.Errorf("got %d distinct records, want 4: %v", len(seen), seen)
+	}
+	for msg, n := range seen {
+		if n != 1 {
+			t.Errorf("record %q delivered %d times, want 1", msg, n)
+		}
+	}
+}
+
+// Splitting has to converge: the client keeps halving until the pieces fit,
+// against a server that answers on size rather than to a script.
+func TestPayloadTooLargeSplitsUntilItFits(t *testing.T) {
+	t.Parallel()
+
+	const records = 16
+	rec := newRecorder(t)
+	c, errs := newTestClient(t, rec, WithBatchSize(1000), WithCompression(CompressionNone))
+	defer c.Close()
+
+	// Sized from a real record so the limit forces several rounds of halving
+	// rather than one.
+	probe, err := NDJSON().AppendRecord(nil, event(0))
+	if err != nil {
+		t.Fatalf("sizing a record: %v", err)
+	}
+	rec.mu.Lock()
+	rec.maxBytes = len(probe) * 3
+	rec.mu.Unlock()
+
+	enqueueN(t, c, records)
+	if err := c.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	if got := c.Stats().Sent; got != records {
+		t.Errorf("Stats().Sent = %d, want %d", got, records)
+	}
+	if got := c.Stats().DroppedOversize; got != 0 {
+		t.Errorf("Stats().DroppedOversize = %d, want 0", got)
+	}
+	if got := errs.len(); got != 0 {
+		t.Errorf("OnError fired %d times: %v", got, errs.all())
+	}
+	if got := len(rec.accepted()); got != records {
+		t.Errorf("%d records arrived, want %d", got, records)
+	}
+}
+
+// Splitting re-frames each half from the original record bytes, so it is the
+// encoder's framing that has to survive it — and a JSON array is the framing
+// where getting that wrong produces a body the server cannot parse rather than
+// one that is merely wrong. Run against both compression settings, since the
+// packer's buffer handling differs between them.
+func TestPayloadTooLargeSplitsWithJSONArray(t *testing.T) {
+	t.Parallel()
+
+	for _, comp := range []struct {
+		name string
+		opt  Compression
+	}{{"gzip", CompressionGzip}, {"none", CompressionNone}} {
+		comp := comp
+		t.Run(comp.name, func(t *testing.T) {
+			t.Parallel()
+
+			const records = 16
+			probe, err := JSONArray().AppendRecord(nil, event(0))
+			if err != nil {
+				t.Fatalf("sizing a record: %v", err)
+			}
+
+			rec := newRecorder(t, withMaxAcceptedBytes(len(probe)*3))
+			c, errs := newTestClient(t, rec,
+				WithBatchSize(1000),
+				WithEncoder(JSONArray()),
+				WithCompression(comp.opt),
+			)
+			defer c.Close()
+
+			enqueueN(t, c, records)
+			if err := c.Flush(context.Background()); err != nil {
+				t.Fatalf("Flush: %v", err)
+			}
+
+			// The recorder has already failed the test if any body — including
+			// the refused ones — was not a valid JSON array of objects.
+			if got := c.Stats().Sent; got != records {
+				t.Errorf("Stats().Sent = %d, want %d", got, records)
+			}
+			if got := len(rec.accepted()); got != records {
+				t.Errorf("%d records arrived, want %d", got, records)
+			}
+			if got := errs.len(); got != 0 {
+				t.Errorf("OnError fired %d times: %v", got, errs.all())
+			}
+
+			seen := map[string]int{}
+			for _, m := range rec.accepted() {
+				seen[m[KeyMessage].(string)]++
+			}
+			if len(seen) != records {
+				t.Errorf("got %d distinct records, want %d", len(seen), records)
+			}
+		})
+	}
+}
+
+// Splitting bottoms out. Against a server that refuses everything on size, the
+// batch is halved all the way down to single records, each of which is then
+// dropped and accounted — rather than looping, or losing the count on the way.
+func TestPayloadTooLargeSplitsDownToNothing(t *testing.T) {
+	t.Parallel()
+
+	const records = 8
+	rec := newRecorder(t, withMaxAcceptedBytes(1))
+	c, errs := newTestClient(t, rec, WithBatchSize(1000), WithCompression(CompressionNone))
+	defer c.Close()
+
+	enqueueN(t, c, records)
+	err := c.Flush(context.Background())
+
+	var se *StatusError
+	if !errors.As(err, &se) || se.StatusCode != 413 {
+		t.Fatalf("Flush error = %v, want a *StatusError with 413", err)
+	}
+	if got := c.Stats().Sent; got != 0 {
+		t.Errorf("Stats().Sent = %d, want 0", got)
+	}
+	if got := c.Stats().DroppedOversize; got != records {
+		t.Errorf("Stats().DroppedOversize = %d, want %d", got, records)
+	}
+	if got := c.Stats().DroppedRejected; got != 0 {
+		t.Errorf("Stats().DroppedRejected = %d, want 0", got)
+	}
+	// One report per unsplittable record, and no more: the halving itself is
+	// silent, so the user hears about the eight records, not about the fifteen
+	// requests it took to isolate them.
+	if got := errs.len(); got != records {
+		t.Errorf("OnError fired %d times, want %d: %v", got, records, errs.all())
+	}
+}
+
+// A single record the server will not take cannot be made smaller. It is
+// dropped, counted as oversize, and reported once — naming the knob that fixes
+// it, since nothing else in the message would tell the user what to do.
+func TestPayloadTooLargeSingleRecordIsDropped(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t, withStatuses(413))
+	c, errs := newTestClient(t, rec, WithBatchSize(1))
+	defer c.Close()
+
+	enqueueN(t, c, 1)
+	err := c.Flush(context.Background())
+
+	var se *StatusError
+	if !errors.As(err, &se) || se.StatusCode != 413 {
+		t.Fatalf("Flush error = %v, want a *StatusError with 413", err)
+	}
+	if got := c.Stats().DroppedOversize; got != 1 {
+		t.Errorf("Stats().DroppedOversize = %d, want 1", got)
 	}
 	if got := c.Stats().DroppedRejected; got != 0 {
 		t.Errorf("Stats().DroppedRejected = %d, want 0: a 413 is an oversize drop", got)
 	}
+	if got := rec.count(); got != 1 {
+		t.Errorf("got %d requests, want 1: an unsplittable record was resent", got)
+	}
 	found := false
-	for _, err := range errs.all() {
-		if strings.Contains(err.Error(), "WithMaxBatchBytes") {
+	for _, e := range errs.all() {
+		if strings.Contains(e.Error(), "WithMaxBatchBytes") {
 			found = true
 		}
 	}

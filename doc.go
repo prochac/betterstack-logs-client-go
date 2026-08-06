@@ -52,10 +52,15 @@
 // source token, an exhausted quota and an unparseable body are terminal:
 // retrying those burns quota forever and can never succeed.
 //
+// A batch the server rejects as too large is halved and both pieces resent,
+// repeatedly if need be. Only a single record that is too large on its own is
+// dropped, since nothing can be done with it.
+//
 // # Wire format
 //
 // Records are sent as newline-delimited JSON, gzip-compressed, to
 // [DefaultEndpoint]. Attributes are nested under "context"; see
 // [DefaultConverter] for the record shape and [WithContextKey] to change or
-// flatten the nesting.
+// flatten the nesting. [JSONArray] sends a JSON array instead, and
+// [WithEncoder] takes any other implementation of [Encoder].
 package betterstack

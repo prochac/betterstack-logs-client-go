@@ -13,10 +13,6 @@ import (
 )
 
 const (
-	// retryCeiling bounds the total time spent on one batch across all
-	// attempts, independently of MaxRetries. OpenTelemetry's OTLP exporter uses
-	// the same minute. Promoted to an option in a later milestone.
-	retryCeiling = 60 * time.Second
 	// maxBackoff caps the exponential growth.
 	maxBackoff = 30 * time.Second
 	// maxRetryAfter caps what a Retry-After header can ask for, so a hostile or
@@ -59,12 +55,46 @@ func newTransport(cfg clientConfig) *http.Transport {
 	}
 }
 
+// worker is one upload goroutine's private state.
+//
+// It exists for the packer. Splitting a batch after a 413 means framing and
+// compressing again, off the sender goroutine, and a gzip.Writer cannot be
+// shared — so each worker gets its own, built the first time it actually needs
+// one. Most workers, in most processes, never build one at all.
+type worker struct {
+	c   *Client
+	rnd *rand.Rand
+	pk  *packer
+}
+
+func (w *worker) packer() *packer {
+	if w.pk == nil {
+		w.pk = newPacker(w.c.cfg.compression)
+	}
+	return w.pk
+}
+
 // upload delivers one batch, owning the entire retry budget for it.
 //
 // It returns only when the batch has been accepted, terminally rejected, run
 // out of budget, or the client is shutting down.
-func (c *Client) upload(ctx context.Context, b *batch, rnd *rand.Rand) error {
-	deadline := time.Now().Add(retryCeiling)
+func (w *worker) upload(ctx context.Context, b *batch) error {
+	if w.c.cfg.dryRun {
+		// The kill switch. Everything up to here has run for real — conversion,
+		// encoding, batching, framing, compression — which is what makes a dry
+		// run worth anything as a test of the pipeline.
+		w.c.stats.sent.Add(uint64(b.records))
+		return nil
+	}
+	return w.uploadBy(ctx, b, time.Now().Add(w.c.cfg.retryCeiling))
+}
+
+// uploadBy is upload against an already-established deadline. A batch produced
+// by splitting inherits its parent's, so that halving cannot buy more time than
+// the original batch was granted.
+func (w *worker) uploadBy(ctx context.Context, b *batch, deadline time.Time) error {
+	c := w.c
+	rnd := w.rnd
 
 	var (
 		lastErr    error
@@ -111,8 +141,20 @@ func (c *Client) upload(ctx context.Context, b *batch, rnd *rand.Rand) error {
 				Records:    b.records,
 				Retryable:  retryable,
 			}
+
+			// 413 is not retryable — the same bytes would fail again — but it
+			// is recoverable, which is a different thing. Half the batch may
+			// well fit. This is the only case the local size check cannot
+			// pre-empt: MaxBatchBytes is measured before compression and the
+			// server's limit applies after it, so how much fits is not
+			// knowable until the server says.
+			if status == http.StatusRequestEntityTooLarge && b.records > 1 {
+				return w.splitAndSend(ctx, b, deadline)
+			}
+
 			if !retryable {
 				if status == http.StatusRequestEntityTooLarge {
+					// One record, too large on its own. Nothing to split.
 					c.stats.droppedOversize.Add(uint64(b.records))
 				} else {
 					c.stats.droppedRejected.Add(uint64(b.records))
@@ -129,6 +171,37 @@ func (c *Client) upload(ctx context.Context, b *batch, rnd *rand.Rand) error {
 		b.records, c.cfg.maxRetries+1, lastErr)
 	c.report(err)
 	return err
+}
+
+// splitAndSend halves a batch the server called too large and delivers both
+// pieces, recursively, until each is small enough or is down to the single
+// record that cannot be split further.
+//
+// Each half restarts the attempt count but inherits the parent's deadline, so
+// the recursion — at most log2(BatchSize) deep — is bounded in wall-clock time
+// by RetryCeiling however many times it splits.
+//
+// The two halves go out one after the other on this worker rather than back
+// through the pool. Handing them to the pool would be a deadlock: the pool's
+// dispatch blocks when every worker is busy, and this worker, being one of the
+// busy ones, would be waiting on itself.
+func (w *worker) splitAndSend(ctx context.Context, b *batch, deadline time.Time) error {
+	left, right, err := w.packer().split(w.c.cfg.encoder, b)
+	if err != nil {
+		w.c.stats.droppedRejected.Add(uint64(b.records))
+		err = fmt.Errorf("betterstack: splitting %d record(s) after a 413: %w", b.records, err)
+		w.c.report(err)
+		return err
+	}
+
+	// Both halves are attempted whatever the first one does: they are separate
+	// batches now, and one failing is no reason to abandon the other.
+	errLeft := w.uploadBy(ctx, left, deadline)
+	errRight := w.uploadBy(ctx, right, deadline)
+	if errLeft != nil {
+		return errLeft
+	}
+	return errRight
 }
 
 // do performs one upload attempt.

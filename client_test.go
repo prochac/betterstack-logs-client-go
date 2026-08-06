@@ -490,6 +490,36 @@ func TestStatsBalance(t *testing.T) {
 		}
 	})
 
+	// Splitting moves records between batches after the accounting has started,
+	// which is exactly where a double-count or a lost count would hide.
+	t.Run("under batch splitting", func(t *testing.T) {
+		t.Parallel()
+		rec := newRecorder(t, withMaxAcceptedBytes(200))
+		c, _ := newTestClient(t, rec, WithBatchSize(64), WithCompression(CompressionNone))
+		enqueueN(t, c, 256)
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		assertStatsBalance(t, c)
+		if got := c.Stats().Sent; got != 256 {
+			t.Errorf("Sent = %d, want 256", got)
+		}
+	})
+
+	t.Run("dry run", func(t *testing.T) {
+		t.Parallel()
+		rec := newRecorder(t)
+		c, _ := newTestClient(t, rec, WithBatchSize(10), WithDryRun(true))
+		enqueueN(t, c, 100)
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		assertStatsBalance(t, c)
+		if got := c.Stats().Sent; got != 100 {
+			t.Errorf("Sent = %d, want 100: a dry run still accounts for its records", got)
+		}
+	})
+
 	t.Run("under stall and overflow", func(t *testing.T) {
 		t.Parallel()
 		rec := newRecorder(t, withGate())

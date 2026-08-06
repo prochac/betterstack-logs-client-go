@@ -1,7 +1,9 @@
 package betterstack
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -170,33 +172,38 @@ func TestWithEncoder(t *testing.T) {
 	}
 }
 
-// countingEncoder proves the Encoder interface is actually pluggable, and that
-// AppendRecord receives the record's index within the batch — which is what a
-// JSON-array or MessagePack framing needs and what a bare marshaller cannot
-// express.
+// countingEncoder proves the Encoder interface is actually pluggable: a format
+// with its own content type and its own framing, neither of which a bare
+// marshaller function could express.
 type countingEncoder struct{}
 
 func (countingEncoder) ContentType() string { return "application/x-test" }
 
-func (countingEncoder) AppendRecord(dst []byte, index int, _ map[string]any) ([]byte, error) {
-	return append(dst, []byte(strings.Repeat("x", index+1)+"\n")...), nil
+func (countingEncoder) AppendRecord(dst []byte, _ map[string]any) ([]byte, error) {
+	return append(dst, "x\n"...), nil
 }
 
-func (countingEncoder) Frame(batch []byte, _ int) []byte { return batch }
+// A framing that depends on the record count, so that a batch which is split
+// and re-framed cannot pass by accident.
+func (countingEncoder) Frame(batch []byte, n int) []byte {
+	return append(batch, []byte(fmt.Sprintf("count=%d\n", n))...)
+}
 
-func TestEncoderReceivesRecordIndex(t *testing.T) {
+func TestEncoderFramesEachBatch(t *testing.T) {
 	t.Parallel()
 
-	enc := countingEncoder{}
-	var buf []byte
-	for i := 0; i < 3; i++ {
-		var err error
-		if buf, err = enc.AppendRecord(buf, i, nil); err != nil {
-			t.Fatal(err)
-		}
+	rec := newRecorder(t)
+	c, _ := newTestClient(t, rec, WithBatchSize(1000),
+		WithEncoder(countingEncoder{}), WithCompression(CompressionNone))
+	defer c.Close()
+
+	enqueueN(t, c, 3)
+	if err := c.Flush(nil); err != nil {
+		t.Fatalf("Flush: %v", err)
 	}
-	if got, want := string(buf), "x\nxx\nxxx\n"; got != want {
-		t.Errorf("got %q, want %q: the index was not threaded through", got, want)
+
+	if got, want := string(rec.all()[0].body), "x\nx\nx\ncount=3\n"; got != want {
+		t.Errorf("body = %q, want %q", got, want)
 	}
 }
 
@@ -231,10 +238,84 @@ func TestDefaultOnErrorIsInstalled(t *testing.T) {
 	c.report(&DropError{Records: 1, Reason: DropQueueFull})
 }
 
-// A batch over the hard request limit is dropped before it is sent: the server
-// would reject it, so spending a request and a retry budget to find that out
-// wastes the customer's quota and delays everything behind it.
-func TestOversizeBatchIsDroppedBeforeSending(t *testing.T) {
+func TestWithJSONArrayEncoder(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, _ := newTestClient(t, rec, WithBatchSize(1000), WithEncoder(JSONArray()))
+	defer c.Close()
+
+	enqueueN(t, c, 3)
+	if err := c.Flush(nil); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	req := rec.all()[0]
+	if got := req.header.Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	// The recorder has already asserted the body parses as an array of objects;
+	// what is left is that all three records are in it, in order.
+	if got := len(req.records); got != 3 {
+		t.Fatalf("got %d records in the array, want 3: %q", got, req.body)
+	}
+	for i, m := range req.records {
+		if got, want := m[KeyMessage], fmt.Sprintf("record-%d", i); got != want {
+			t.Errorf("record %d = %v, want %q", i, got, want)
+		}
+	}
+}
+
+// The same client-side backstop as TestOversizeRecordIsDroppedBeforeSending,
+// but with something to split: the batch is halved locally rather than thrown
+// away, exactly as it would be had the server been the one to complain.
+func TestOversizeBatchIsSplitBeforeSending(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, errs := newTestClient(t, rec,
+		WithBatchSize(4),
+		WithCompression(CompressionNone), // so the body size is predictable
+		WithMaxBatchBytes(hardMaxRequestBytes*4),
+	)
+	defer c.Close()
+
+	// Four records of a third of the limit each: the batch is over, every half
+	// and quarter is not.
+	big := strings.Repeat("x", hardMaxRequestBytes/3)
+	for i := 0; i < 4; i++ {
+		if err := c.Enqueue(map[string]any{KeyMessage: big, KeyLevel: "INFO"}); err != nil {
+			t.Fatalf("Enqueue(%d): %v", i, err)
+		}
+	}
+	if err := c.Flush(nil); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	if got := c.Stats().Sent; got != 4 {
+		t.Errorf("Stats().Sent = %d, want 4", got)
+	}
+	if got := c.Stats().DroppedOversize; got != 0 {
+		t.Errorf("Stats().DroppedOversize = %d, want 0: the batch was splittable", got)
+	}
+	if got := rec.count(); got < 2 {
+		t.Errorf("got %d requests, want at least 2: the batch was not split", got)
+	}
+	for _, req := range rec.all() {
+		if len(req.body) > hardMaxRequestBytes {
+			t.Errorf("a request of %d bytes went out over the %d limit", len(req.body), hardMaxRequestBytes)
+		}
+	}
+	if got := errs.len(); got != 0 {
+		t.Errorf("OnError fired %d times: %v", got, errs.all())
+	}
+}
+
+// A single record over the hard request limit is dropped before it is sent: it
+// cannot be split, and the server would reject it, so spending a request and a
+// retry budget to find that out wastes the customer's quota and delays
+// everything behind it.
+func TestOversizeRecordIsDroppedBeforeSending(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t)
@@ -268,6 +349,97 @@ func TestOversizeBatchIsDroppedBeforeSending(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("no oversize drop reported: %v", errs.all())
+	}
+}
+
+// --- dry run ----------------------------------------------------------------
+
+// A dry run runs the whole pipeline and skips only the request. That is what
+// makes it useful: the encoding, batching and compression a real send would do
+// still happen, so a bug in any of them still shows up.
+func TestDryRunSendsNothing(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, errs := newTestClient(t, rec, WithBatchSize(10), WithDryRun(true))
+	defer c.Close()
+
+	enqueueN(t, c, 25)
+	if err := c.Flush(nil); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	if got := rec.count(); got != 0 {
+		t.Errorf("got %d requests, want 0: the kill switch did not stop them", got)
+	}
+	if got := c.Stats().Sent; got != 25 {
+		t.Errorf("Stats().Sent = %d, want 25", got)
+	}
+	if got := errs.len(); got != 0 {
+		t.Errorf("OnError fired %d times on a dry run: %v", got, errs.all())
+	}
+}
+
+// The point of the switch is running without credentials, so it must not demand
+// one. Everything else is still validated.
+func TestDryRunNeedsNoSourceToken(t *testing.T) {
+	t.Parallel()
+
+	c, err := NewClient("", WithDryRun(true))
+	if err != nil {
+		t.Fatalf("NewClient(\"\", WithDryRun(true)) = %v, want it to succeed", err)
+	}
+	defer c.Close()
+
+	if err := c.Enqueue(event(0)); err != nil {
+		t.Errorf("Enqueue: %v", err)
+	}
+
+	if _, err := NewClient("", WithDryRun(true), WithBatchSize(0)); err == nil {
+		t.Error("a dry run accepted WithBatchSize(0): only the token check is waived")
+	}
+	if _, err := NewClient(""); !errors.Is(err, ErrNoSourceToken) {
+		t.Errorf("NewClient(\"\") = %v, want ErrNoSourceToken when not a dry run", err)
+	}
+}
+
+// --- retry ceiling ----------------------------------------------------------
+
+// The ceiling is the second of the two retry limits, and the tighter one wins.
+// Here it stops a batch that MaxRetries alone would have kept alive.
+func TestRetryCeilingCutsRetriesShort(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t, withStatuses(503, 503, 503, 503, 503, 503, 503, 503, 503, 503))
+	c, _ := newTestClient(t, rec,
+		WithBatchSize(1000),
+		WithMaxRetries(100),
+		WithRetryBackoff(50*time.Millisecond),
+		WithRetryCeiling(150*time.Millisecond),
+	)
+	defer c.Close()
+
+	enqueueN(t, c, 2)
+	if err := c.Flush(context.Background()); err == nil {
+		t.Fatal("Flush = nil, want the batch to have been given up on")
+	}
+
+	// An exact request count would be a flake: full jitter can make any single
+	// backoff near zero, so the number of attempts that fit inside the ceiling
+	// varies. What must hold is that 101 attempts did not.
+	if got := rec.count(); got > 20 {
+		t.Errorf("got %d requests: the ceiling did not bound the retries", got)
+	}
+	if got := c.Stats().DroppedRejected; got != 2 {
+		t.Errorf("Stats().DroppedRejected = %d, want 2", got)
+	}
+}
+
+func TestRetryCeilingIsValidated(t *testing.T) {
+	t.Parallel()
+
+	if _, err := NewClient(testToken, WithRetryCeiling(0)); err == nil {
+		t.Error("WithRetryCeiling(0) was accepted")
 	}
 }
 

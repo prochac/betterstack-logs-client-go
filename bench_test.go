@@ -174,7 +174,7 @@ func BenchmarkNDJSONAppendRecord(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buf, err := enc.AppendRecord(nil, i, ev)
+		buf, err := enc.AppendRecord(nil, ev)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -197,7 +197,7 @@ func BenchmarkBatchAssembly(b *testing.B) {
 		buf = buf[:0]
 		for j := 0; j < perBatch; j++ {
 			var err error
-			if buf, err = enc.AppendRecord(buf, j, ev); err != nil {
+			if buf, err = enc.AppendRecord(buf, ev); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -210,7 +210,7 @@ func BenchmarkCompress(b *testing.B) {
 	var body []byte
 	for i := 0; i < 1000; i++ {
 		var err error
-		body, err = enc.AppendRecord(body, i, map[string]any{
+		body, err = enc.AppendRecord(body, map[string]any{
 			KeyMessage: fmt.Sprintf("request %d completed", i),
 			KeyLevel:   "INFO",
 		})

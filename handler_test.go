@@ -99,7 +99,7 @@ func slogtestResults(t *testing.T, events []map[string]any) []map[string]any {
 	var buf []byte
 	for i, ev := range events {
 		var err error
-		buf, err = NDJSON().AppendRecord(buf, i, ev)
+		buf, err = NDJSON().AppendRecord(buf, ev)
 		if err != nil {
 			t.Fatalf("encoding record %d: %v", i, err)
 		}
@@ -232,6 +232,213 @@ func TestConcurrentHandleAcrossDerivedHandlers(t *testing.T) {
 
 	if got, want := sink.len(), goroutines*perGoroutine; got != want {
 		t.Errorf("got %d records, want %d", got, want)
+	}
+}
+
+// --- extra fields -----------------------------------------------------------
+
+func TestWithExtraFields(t *testing.T) {
+	t.Parallel()
+
+	sink := &stubSink{}
+	logger := slog.New(newHandler(sink, WithExtraFields(map[string]any{
+		"service": "checkout",
+		"env":     "prod",
+	})))
+
+	logger.Info("one")
+	logger.WithGroup("req").With("id", "r-1").Info("two")
+
+	for i, ev := range sink.all() {
+		ctx, ok := ev[DefaultContextKey].(map[string]any)
+		if !ok {
+			t.Fatalf("record %d has no context block: %v", i, ev)
+		}
+		if got := ctx["service"]; got != "checkout" {
+			t.Errorf("record %d: service = %v, want %q", i, got, "checkout")
+		}
+		if got := ctx["env"]; got != "prod" {
+			t.Errorf("record %d: env = %v, want %q", i, got, "prod")
+		}
+	}
+
+	// They belong to the record, not to whatever group happened to be open.
+	second := sink.all()[1][DefaultContextKey].(map[string]any)
+	if _, nested := second["req"].(map[string]any)["service"]; nested {
+		t.Error("an extra field was placed inside an open group")
+	}
+}
+
+// Extra fields are the most general thing said about a record, so anything more
+// specific about this particular one wins.
+func TestExtraFieldsYieldToRealAttrs(t *testing.T) {
+	t.Parallel()
+
+	sink := &stubSink{}
+	h := newHandler(sink,
+		WithExtraFields(map[string]any{"service": "default", "env": "prod"}),
+		WithAttrFromContext(func(context.Context) []slog.Attr {
+			return []slog.Attr{slog.String("env", "from-context")}
+		}),
+	)
+	slog.New(h).With("service", "explicit").Info("hello")
+
+	ctx := sink.last(t)[DefaultContextKey].(map[string]any)
+	if got := ctx["service"]; got != "explicit" {
+		t.Errorf("service = %v, want %q: an extra field beat a real attribute", got, "explicit")
+	}
+	if got := ctx["env"]; got != "from-context" {
+		t.Errorf("env = %v, want %q: an extra field beat a context extractor", got, "from-context")
+	}
+}
+
+func TestExtraFieldsFlattenWithEmptyContextKey(t *testing.T) {
+	t.Parallel()
+
+	sink := &stubSink{}
+	h := newHandler(sink,
+		WithContextKey(""),
+		WithExtraFields(map[string]any{"service": "checkout"}),
+	)
+	slog.New(h).Info("hello")
+
+	ev := sink.last(t)
+	if got := ev["service"]; got != "checkout" {
+		t.Errorf("service = %v, want it at the top level: %v", got, ev)
+	}
+	if _, nested := ev[DefaultContextKey]; nested {
+		t.Errorf("a context block was created despite an empty context key: %v", ev)
+	}
+}
+
+// The caller's map must not be live: mutating it after construction cannot be
+// allowed to race every Handle call.
+func TestExtraFieldsAreCopied(t *testing.T) {
+	t.Parallel()
+
+	fields := map[string]any{"service": "checkout"}
+	sink := &stubSink{}
+	h := newHandler(sink, WithExtraFields(fields))
+
+	fields["service"] = "mutated"
+	fields["late"] = "addition"
+	slog.New(h).Info("hello")
+
+	ctx := sink.last(t)[DefaultContextKey].(map[string]any)
+	if got := ctx["service"]; got != "checkout" {
+		t.Errorf("service = %v, want %q: the caller's map was retained", got, "checkout")
+	}
+	if _, ok := ctx["late"]; ok {
+		t.Errorf("a key added after construction appeared: %v", ctx)
+	}
+}
+
+// Extra fields go through the same attribute path as everything else, so they
+// get the same value mapping.
+func TestExtraFieldsGetValueMapping(t *testing.T) {
+	t.Parallel()
+
+	sink := &stubSink{}
+	h := newHandler(sink, WithExtraFields(map[string]any{
+		"boot": 90 * time.Second,
+	}))
+	slog.New(h).Info("hello")
+
+	ctx := sink.last(t)[DefaultContextKey].(map[string]any)
+	if got := ctx["boot"]; got != "1m30s" {
+		t.Errorf("boot = %v (%T), want the mapped duration string", got, got)
+	}
+}
+
+// --- filter -----------------------------------------------------------------
+
+func TestWithFilter(t *testing.T) {
+	t.Parallel()
+
+	sink := &stubSink{}
+	h := newHandler(sink, WithFilter(func(_ context.Context, r slog.Record) bool {
+		return !strings.Contains(r.Message, "health")
+	}))
+	logger := slog.New(h)
+
+	logger.Info("health check ok")
+	logger.Info("real work")
+	logger.Info("health check ok again")
+
+	events := sink.all()
+	if len(events) != 1 {
+		t.Fatalf("got %d records, want 1: %v", len(events), events)
+	}
+	if got := events[0][KeyMessage]; got != "real work" {
+		t.Errorf("the wrong record survived: %v", got)
+	}
+}
+
+// The predicate sees the context, which is most of the point: it can ask
+// questions about the request that the record alone cannot answer.
+func TestFilterSeesTheContext(t *testing.T) {
+	t.Parallel()
+
+	type key struct{}
+	sink := &stubSink{}
+	h := newHandler(sink, WithFilter(func(ctx context.Context, _ slog.Record) bool {
+		return ctx.Value(key{}) == "keep"
+	}))
+
+	logger := slog.New(h)
+	logger.InfoContext(context.WithValue(context.Background(), key{}, "keep"), "kept")
+	logger.InfoContext(context.WithValue(context.Background(), key{}, "drop"), "dropped")
+
+	events := sink.all()
+	if len(events) != 1 {
+		t.Fatalf("got %d records, want 1: %v", len(events), events)
+	}
+	if got := events[0][KeyMessage]; got != "kept" {
+		t.Errorf("the wrong record survived: %v", got)
+	}
+}
+
+// A filtered record was never sent for, so it is not a drop and must not show
+// up in the accounting.
+func TestFilteredRecordsAreNotCounted(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, _ := newTestClient(t, rec, WithBatchSize(1000))
+	defer c.Close()
+
+	logger := slog.New(NewHandler(c, WithFilter(func(context.Context, slog.Record) bool {
+		return false
+	})))
+	for i := 0; i < 10; i++ {
+		logger.Info("dropped by the filter")
+	}
+	if err := c.Flush(nil); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	if got := c.Stats().Enqueued; got != 0 {
+		t.Errorf("Stats().Enqueued = %d, want 0", got)
+	}
+	if got := rec.count(); got != 0 {
+		t.Errorf("got %d requests, want 0", got)
+	}
+}
+
+// A filter that keeps everything must not perturb the normal path.
+func TestFilterKeepingEverything(t *testing.T) {
+	t.Parallel()
+
+	sink := &stubSink{}
+	h := newHandler(sink, WithFilter(func(context.Context, slog.Record) bool { return true }))
+	slog.New(h).Info("hello", "a", 1)
+
+	ev := sink.last(t)
+	if got := ev[KeyMessage]; got != "hello" {
+		t.Errorf("message = %v, want %q", got, "hello")
+	}
+	if got := ev[DefaultContextKey].(map[string]any)["a"]; got != int64(1) {
+		t.Errorf("a = %v (%T), want 1", got, got)
 	}
 }
 

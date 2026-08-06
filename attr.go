@@ -55,7 +55,14 @@ type treeBuilder struct {
 //     request rather than about the call site. A trace ID should not move
 //     around the payload depending on which derived logger happened to emit
 //     the line.
-func (b *treeBuilder) build(goas []groupOrAttrs, ctxAttrs []slog.Attr, r *slog.Record, source map[string]any) map[string]any {
+//   - the handler's extra fields, for the same reason, one step more global
+//     still.
+//
+// Those three are applied in increasing order of generality, and extra fields
+// yield to any key already taken. So a record attribute beats a context
+// extractor, which beats an extra field — the more specific statement about
+// this particular line wins.
+func (b *treeBuilder) build(goas []groupOrAttrs, ctxAttrs []slog.Attr, r *slog.Record, source map[string]any, extra map[string]any) map[string]any {
 	root := b.walk(goas, nil, func(dst map[string]any, groups []string) {
 		r.Attrs(func(a slog.Attr) bool {
 			b.appendAttr(dst, groups, a)
@@ -68,6 +75,17 @@ func (b *treeBuilder) build(goas []groupOrAttrs, ctxAttrs []slog.Attr, r *slog.R
 	}
 	if source != nil {
 		b.appendAttr(root, nil, slog.Any(slog.SourceKey, source))
+	}
+	for k, v := range extra {
+		// Routed through appendAttr rather than written straight into the map,
+		// so an extra field gets the same value mapping and the same
+		// ReplaceAttr treatment as any other attribute. The one consequence
+		// worth knowing: a ReplaceAttr that renames keys can defeat the check
+		// below, since it runs after it.
+		if _, taken := root[k]; taken {
+			continue
+		}
+		b.appendAttr(root, nil, slog.Any(k, v))
 	}
 	return root
 }
