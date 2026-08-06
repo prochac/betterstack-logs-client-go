@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	msgpack "github.com/shamaton/msgpack/v2"
 )
 
 // benchClient returns a client pointed at a server that accepts everything as
@@ -202,6 +204,41 @@ func BenchmarkNDJSONAppendRecord(b *testing.B) {
 			b.Fatal(err)
 		}
 		_ = buf
+	}
+}
+
+// MsgPack is the one encoder whose Frame does real work: the array header is a
+// variable-width prefix, so the batch has to shift rather than have a reserved
+// byte overwritten. This measures that shift at a realistic batch size, to
+// confirm it is noise beside the gzip pass that immediately follows it —
+// compare BenchmarkCompress.
+func BenchmarkMsgPackFrame(b *testing.B) {
+	enc := MsgPack(msgpack.Marshal)
+	ev := map[string]any{
+		KeyMessage: "a log message",
+		KeyLevel:   "INFO",
+		DefaultContextKey: map[string]any{
+			"service": "api",
+			"index":   1,
+		},
+	}
+
+	const records = 256
+	var batch []byte
+	for i := 0; i < records; i++ {
+		var err error
+		if batch, err = enc.AppendRecord(batch, ev); err != nil {
+			b.Fatal(err)
+		}
+	}
+	// Frame writes into the buffer it is given, so each iteration needs its own.
+	scratch := make([]byte, 0, len(batch)+8)
+
+	b.SetBytes(int64(len(batch)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = enc.Frame(append(scratch[:0], batch...), records)
 	}
 }
 

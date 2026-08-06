@@ -79,7 +79,7 @@ Separate `ClientOption` and `HandlerOption` types so the compiler enforces which
 | `WithConnectTimeout(time.Duration)` | `5s` | Java |
 | `WithHTTPClient(*http.Client)` | tuned internal client | escape hatch; disables the two timeout options |
 | `WithCompression(Compression)` | `CompressionGzip` | `CompressionNone` to disable |
-| `WithEncoder(Encoder)` | `NDJSON` | §4 |
+| `WithEncoder(Encoder)` | `NDJSON` | §4 — also `JSONArray`, `MsgPack(Marshaler)` |
 | `WithOnError(func(error))` | write to `os.Stderr` | PARITY §5 |
 | `WithShutdownTimeout(time.Duration)` | `15s` | used by `Close` |
 | `WithDryRun(bool)` | `false` | JS `sendLogsToBetterStack` kill switch |
@@ -204,9 +204,19 @@ The array encoder does not need it. Every record carries a **leading** comma, an
 
 One byte written and one appended, whatever the batch size. The real constraint this exposes is stronger than positional framing and is now stated on the interface: **a record's encoding must be self-delimiting and independent of its position**, because the same bytes may be re-framed into a different batch entirely when an oversized one is split (§5). The comma scheme satisfies it for any contiguous run of records; a "comma before every record but the first" scheme would not.
 
-`Frame` exists so a JSON-array encoder (`[` … `]`) and, later, MessagePack (array header prefix) fit the same interface without special-casing the sender. `ContentType` travels with the encoder, which is what upstream's bare `Marshaler func(any) ([]byte, error)` option could not express. The exported constructors are `NDJSON()` and `JSONArray()`.
+`Frame` exists so a JSON-array encoder (`[` … `]`) and, later, MessagePack (array header prefix) fit the same interface without special-casing the sender. `ContentType` travels with the encoder, which is what upstream's bare `Marshaler func(any) ([]byte, error)` option could not express. The exported constructors are `NDJSON()`, `JSONArray()` and `MsgPack(Marshaler)`.
 
-MessagePack — what the Node transport actually uses — is deferred to a milestone after v0.1. Implementing it in-module keeps the zero-dependency promise; it is a bounded amount of encoder code for the subset of types a log payload contains.
+**[amended] MessagePack ships as `MsgPack(marshal Marshaler)`, which bundles no codec.** This document previously said it would be written in-module — "implementing it in-module keeps the zero-dependency promise; it is a bounded amount of encoder code for the subset of types a log payload contains". Both halves of that were wrong.
+
+The subset is not bounded. §6's attribute handling resolves a `slog.Value` into a closed set of types for every `Kind` *except* `KindAny`, which keeps `v.Any()` as-is — so an arbitrary user value reaches the encoder, and matching what `encoding/json` does with it means reimplementing reflection over struct tags, `json.Marshaler`, `encoding.TextMarshaler` and embedded fields. Anything less makes the same record serialise differently depending on which encoder is selected.
+
+And the promise is not worth what it would cost here. A hand-rolled serialiser in a client whose whole pitch is auditability is a liability: nobody reads it, and everybody has to trust it. Zero dependencies is a means to being safe to adopt, not an end that outranks it.
+
+Taking a dependency instead was measured and rejected too. Dead-code elimination does not remove an unused codec — with a `MsgPack()` constructor present in the package but never called, `ugorji/go/codec` still cost **+8.73 MB** of stripped binary (+453%) and 5.5× the cold build, because its `init()`-time type registration defeats the linker. `vmihailenco/msgpack/v5` costs +123 KB but has had no commit since October 2023. Every user would pay for a format most of them do not select.
+
+What is actually format-specific here is the framing, and it is a length prefix: a one-, three- or five-byte MessagePack array header. So the split is **the caller brings the codec, this package brings the framing**. `Marshaler` is `func(any) ([]byte, error)`, which is deliberately the signature the common libraries already expose, so most can be passed directly with no adapter; the handle-based ones need a three-line closure. Users tend to have a codec in the build already, and the ones who care about `str`-versus-`bin` or timestamp representation get to decide rather than inherit.
+
+Two consequences worth recording. `AppendRecord` checks that the marshaller returned a map (`0x80`–`0x8f`, `0xde`, `0xdf`), because `MsgPack(json.Marshal)` compiles and would otherwise be diagnosed only as a 406 on every batch. And `Frame` must **shift** the batch rather than return a re-sliced `batch[k:]` with a right-aligned header: `pack` calls it on a buffer it reuses, so a moved start creeps forward by the header width on every batch and grows without bound. The shift measures 285 ns against a 16 KiB batch, versus 67 µs for the gzip pass that immediately follows it.
 
 ### Record shape
 
@@ -347,7 +357,7 @@ PARITY.md         research, contract, defaults, gap checklist
 client.go         Client, ClientOption, queue, Stats, batch, packer, gzip
 sender.go         sender goroutine, batch assembly, uploadPool
 transport.go      http.Client, status classification, retry, 413 split
-encoder.go        Encoder, NDJSON, JSONArray
+encoder.go        Encoder, NDJSON, JSONArray, Marshaler, MsgPack
 handler.go        Handler, HandlerOption, slog.Handler implementation
 converter.go      Converter, DefaultConverter, record shape
 attr.go           attribute/group/ReplaceAttr helpers (original, see §9)
@@ -369,6 +379,8 @@ Real tests are possible from day one because `Flush`/`Close` exist — the curre
 - **Failure paths**, which is where the fork's suite stopped: 5xx → retry then success, 403 → terminal with no retry, 413 → split, network error → retry, retry exhaustion → `OnError` + drop counted, queue full → drop counted and `Handle` does not block.
 - **Concurrency**: `-race` with concurrent `Handle` across handlers derived by `WithAttrs`/`WithGroup`, concurrent `Close`, `Handle` after `Close`.
 - **`goleak.VerifyTestMain`** stays. It is the reason the sender and workers must terminate deterministically on `Close` rather than leaking until process exit — a useful constraint to keep enforced. `goleak` is the one test-only dependency worth its cost; production dependencies stay at zero.
+
+  **[amended]** There are now two. `MsgPack` takes its codec from the caller (§4), so the tests have to supply one, and supplying an independent implementation is the point: it is what makes them evidence that the framing is interoperable MessagePack rather than evidence that we can read back what we wrote. `shamaton/msgpack` was chosen for it — zero transitive dependencies, and its outstanding CVE is a decoder out-of-bounds read on malformed input, which is not the risk profile of a test decoding bytes it just produced. Verified that it reaches importers exactly as `goleak` does: recorded in their `go.sum`, never built. Production dependencies still stay at zero.
 - Time-dependent tests use short real intervals rather than a fake clock; the 1.21 floor rules out `testing/synctest`.
 - Benchmarks for `Handle` (the caller-goroutine cost: convert + encode + channel send) and for batch assembly.
 
@@ -387,7 +399,9 @@ The greenfield rewrite only buys clean licensing if no source is copied.
 
 **v0.2 — parity.** 413 splitting, `ExtraFields`, send-time filter, dry-run, separate connect/request timeouts, JSON-array encoder, README with the full options table. **[amended]** Also `WithRetryCeiling`, which §5 assigned here without §10 listing it. Separate connect/request timeouts in fact shipped in v0.1, with the transport.
 
-**v0.3 — polish.** MessagePack and burst protection, plus `example/` covering context extraction and graceful shutdown. The example and burst protection have landed; MessagePack has not.
+**v0.3 — polish.** MessagePack and burst protection, plus `example/` covering context extraction and graceful shutdown. All three have landed; v0.3 is complete.
+
+**[amended]** MessagePack did not land in the shape §4 described. It ships as `MsgPack(Marshaler)` — the caller's codec, this package's framing — after both alternatives were measured and rejected. §4 above carries the reasoning and the numbers. The rule this milestone illustrates is worth keeping: a zero-dependency promise is a means to being safe to adopt, and where the two conflict it is the promise that gives way, not the safety.
 
 **[amended]** Burst protection arrived without a spec — §10 named it and PARITY §2 quoted JavaScript's two numbers, and nothing else in this document said what it should do. §2 and §3 above now carry that spec: opt-in rather than defaulted, one option rather than two, a token bucket in `Enqueue` ahead of the encode, and `DroppedBurst` in the identity. PARITY §3 ranked it "lowest priority — the bounded queue covers most of the same failure", which is right about *most*: the queue bounds memory but only after every record it drops has been encoded, and it never engages at all while delivery is healthy.
 

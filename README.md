@@ -4,7 +4,8 @@ A [Better Stack](https://betterstack.com/logs) logging client for Go: a
 `log/slog` handler backed by a batching, retrying HTTP client.
 
 Standard library only — no dependencies outside it, and none planned. Go 1.21 or
-newer.
+newer. (The optional MessagePack encoder takes a codec as an argument rather than
+bundling one, so it does not change that; see [MessagePack](#messagepack).)
 
 ```sh
 go get github.com/prochac/logs-client-go
@@ -114,7 +115,7 @@ dropped.
 | `WithConnectTimeout(time.Duration)` | `5s` | TCP connect; no effect with `WithHTTPClient` |
 | `WithShutdownTimeout(time.Duration)` | `15s` | how long `Close` waits |
 | `WithCompression(Compression)` | `CompressionGzip` | `CompressionNone` to disable |
-| `WithEncoder(Encoder)` | `NDJSON()` | `JSONArray()` also provided |
+| `WithEncoder(Encoder)` | `NDJSON()` | `JSONArray()` and `MsgPack(marshal)` also provided |
 | `WithOnError(func(error))` | one line per event to stderr | must not log through this handler |
 | `WithDryRun(bool)` | `false` | run everything except the request |
 | `WithHTTPClient(*http.Client)` | tuned internal client | escape hatch; the client is not owned or closed |
@@ -170,6 +171,44 @@ simply the concatenation of its records, with no framing pass at all.
 
 Gzip is on by default because the API's 10 MiB request limit is measured on
 *compressed* bytes, so it multiplies how much fits in a request.
+
+### MessagePack
+
+`MsgPack` sends `application/msgpack`, but it ships no codec — you pass one in.
+Most libraries' `Marshal` can be handed over directly:
+
+```go
+import "github.com/shamaton/msgpack/v2"       // or vmihailenco/msgpack/v5
+
+betterstack.WithEncoder(betterstack.MsgPack(msgpack.Marshal))
+```
+
+One built around a reusable handle needs a closure:
+
+```go
+import "github.com/ugorji/go/codec"
+
+h := &codec.MsgpackHandle{}
+h.WriteExt = true // without this the timestamp extension degrades to raw bytes
+
+betterstack.WithEncoder(betterstack.MsgPack(func(v any) ([]byte, error) {
+    var out []byte
+    return out, codec.NewEncoderBytes(&out, h).Encode(v)
+}))
+```
+
+No codec is bundled for two reasons. Libraries disagree about timestamps, struct
+tags and whether a Go string becomes `str` or `bin`, and that is your call to
+make — as is keeping it patched. And you probably have one in the build already;
+picking for you would add a second. This package contributes only the array
+framing, which is a length prefix rather than a serialiser, so it stays
+dependency-free.
+
+**Do not switch expecting smaller requests.** Bodies are gzipped by default, and
+gzipped MessagePack is usually no smaller than gzipped JSON — sometimes larger,
+because JSON's repeated keys and ASCII digits compress extremely well. The
+reasons to choose it are exact `int64`/`uint64`, native binary, the timestamp
+extension type, and matching what the Node client sends.
 
 ## Extra fields and filtering
 

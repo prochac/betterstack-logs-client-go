@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	msgpack "github.com/shamaton/msgpack/v2"
 )
 
 const testToken = "src_test_token"
@@ -221,6 +223,42 @@ func (r *recorder) check(header http.Header, raw []byte) recordedRequest {
 			captured.lines = append(captured.lines, line)
 			captured.records = append(captured.records, m)
 		}
+
+	case "application/msgpack":
+		// Decoded with a third-party codec rather than one of our own, so that
+		// what this asserts is that the framing is interoperable MessagePack and
+		// not merely that we can read back what we wrote.
+		var records []map[string]any
+		if err := msgpack.Unmarshal(body, &records); err != nil {
+			r.t.Errorf("body is not a MessagePack array of maps: %v (% x)", err, body)
+			break
+		}
+		if len(records) == 0 {
+			r.t.Errorf("empty MessagePack array body: % x", body)
+		}
+		for _, m := range records {
+			line, err := json.Marshal(m)
+			if err != nil {
+				r.t.Errorf("re-marshalling a decoded record: %v", err)
+				continue
+			}
+			captured.lines = append(captured.lines, line)
+			captured.records = append(captured.records, m)
+		}
+
+	case contentTypeUnchecked:
+		// countingEncoder's format, which exists to prove the Encoder interface
+		// is pluggable and has no payload worth decoding. Named rather than
+		// silently unmatched, so that the default below can be strict.
+
+	default:
+		// Without this, an encoder whose content type the recorder does not know
+		// contributes no records, every records()/accepted() assertion passes
+		// vacuously, and the test suite reports success for a format it never
+		// looked at.
+		r.t.Errorf("unrecognised Content-Type %q: teach recorder.check to decode it, "+
+			"or the tests will pass without inspecting a single record",
+			header.Get("Content-Type"))
 	}
 	return captured
 }

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	msgpack "github.com/shamaton/msgpack/v2"
 )
 
 // reportDrops emits deltas, so a steady state produces no repeat reports and a
@@ -208,12 +210,17 @@ func TestWithEncoder(t *testing.T) {
 	}
 }
 
+// contentTypeUnchecked is countingEncoder's content type, and the one body shape
+// recorder.check deliberately does not decode. Everything else must be
+// recognised there — see the default case.
+const contentTypeUnchecked = "application/x-test"
+
 // countingEncoder proves the Encoder interface is actually pluggable: a format
 // with its own content type and its own framing, neither of which a bare
 // marshaller function could express.
 type countingEncoder struct{}
 
-func (countingEncoder) ContentType() string { return "application/x-test" }
+func (countingEncoder) ContentType() string { return contentTypeUnchecked }
 
 func (countingEncoder) AppendRecord(dst []byte, _ map[string]any) ([]byte, error) {
 	return append(dst, "x\n"...), nil
@@ -299,6 +306,67 @@ func TestWithJSONArrayEncoder(t *testing.T) {
 		if got, want := m[KeyMessage], fmt.Sprintf("record-%d", i); got != want {
 			t.Errorf("record %d = %v, want %q", i, got, want)
 		}
+	}
+}
+
+func TestWithMsgPackEncoder(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, _ := newTestClient(t, rec, WithBatchSize(1000), WithEncoder(MsgPack(msgpack.Marshal)))
+	defer c.Close()
+
+	enqueueN(t, c, 3)
+	if err := c.Flush(nil); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	req := rec.all()[0]
+	if got := req.header.Get("Content-Type"); got != "application/msgpack" {
+		t.Errorf("Content-Type = %q, want application/msgpack", got)
+	}
+	// The recorder has already decoded the body as a MessagePack array of maps,
+	// with a codec that knows nothing about this package. What is left is that
+	// all three records are in it, in order.
+	if got := len(req.records); got != 3 {
+		t.Fatalf("got %d records in the array, want 3: % x", got, req.body)
+	}
+	for i, m := range req.records {
+		if got, want := m[KeyMessage], fmt.Sprintf("record-%d", i); got != want {
+			t.Errorf("record %d = %v, want %q", i, got, want)
+		}
+	}
+}
+
+// A record's time survives the round trip as a time, not as a string: the codec
+// writes the MessagePack timestamp extension for the reserved dt key, which the
+// ingestion API accepts (PARITY §1). This is the one place the two JSON encoders
+// and this one genuinely differ on the wire.
+func TestMsgPackEncodesTimeAsATimestamp(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, _ := newTestClient(t, rec, WithBatchSize(1000), WithEncoder(MsgPack(msgpack.Marshal)))
+	defer c.Close()
+
+	when := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	if err := c.Enqueue(map[string]any{KeyTime: when, KeyMessage: "x"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := c.Flush(nil); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	var decoded []map[string]any
+	if err := msgpack.Unmarshal(rec.all()[0].body, &decoded); err != nil {
+		t.Fatalf("decoding body: %v", err)
+	}
+	got, ok := decoded[0][KeyTime].(time.Time)
+	if !ok {
+		t.Fatalf("%s decoded as %T (%v), want time.Time", KeyTime, decoded[0][KeyTime], decoded[0][KeyTime])
+	}
+	if !got.Equal(when) {
+		t.Errorf("%s = %v, want %v", KeyTime, got, when)
 	}
 }
 

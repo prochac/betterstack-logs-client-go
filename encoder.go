@@ -2,7 +2,10 @@ package betterstack
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"sync"
 )
 
@@ -126,6 +129,115 @@ func (jsonArrayEncoder) AppendRecord(dst []byte, v map[string]any) ([]byte, erro
 
 	dst = append(dst, ',')
 	return append(dst, b...), nil
+}
+
+// Marshaler encodes one log record as a self-contained MessagePack map.
+//
+// It matches the Marshal function the common MessagePack libraries expose, so
+// most of them can be handed over directly, with no adapter:
+//
+//	betterstack.WithEncoder(betterstack.MsgPack(msgpack.Marshal))
+//
+// A library built around a reusable handle needs a closure instead:
+//
+//	h := &codec.MsgpackHandle{}
+//	h.WriteExt = true // otherwise the timestamp extension degrades to raw bytes
+//	betterstack.MsgPack(func(v any) ([]byte, error) {
+//		var out []byte
+//		return out, codec.NewEncoderBytes(&out, h).Encode(v)
+//	})
+//
+// A Marshaler must be safe for concurrent use: one Encoder is shared by every
+// goroutine calling Enqueue.
+type Marshaler func(v any) ([]byte, error)
+
+// MsgPack returns an encoder that sends a batch as one MessagePack array, as
+// application/msgpack, marshalling each record with marshal. It panics if
+// marshal is nil, since an encoder that cannot encode has no useful behaviour
+// to fall back on and failing at construction beats failing per record.
+//
+// No codec is bundled, deliberately. MessagePack libraries disagree about
+// timestamps, struct tags and whether a Go string becomes str or bin, and that
+// choice belongs to the caller — as does keeping it patched. Callers also tend
+// to have one in the build already. This package contributes only the array
+// framing, which is a length prefix rather than a serialiser, and so takes no
+// dependency of its own.
+//
+// The wire size is worth being honest about: bodies are gzipped by default, and
+// gzipped MessagePack is usually no smaller than gzipped JSON, sometimes larger.
+// The reasons to choose it are exact int64 and uint64, native binary, the
+// timestamp extension type, and parity with the Node client — not bandwidth.
+func MsgPack(marshal Marshaler) Encoder {
+	if marshal == nil {
+		panic("betterstack: MsgPack requires a non-nil Marshaler")
+	}
+	return msgpackEncoder{marshal: marshal}
+}
+
+type msgpackEncoder struct{ marshal Marshaler }
+
+func (msgpackEncoder) ContentType() string { return "application/msgpack" }
+
+// Frame prefixes the batch with a MessagePack array header for n records.
+//
+// The header is one, three or five bytes depending on n, so unlike JSONArray
+// there is no fixed-width byte a record could reserve for Frame to overwrite —
+// the batch has to shift. That costs one memmove, which is noise beside the gzip
+// pass that immediately follows it.
+//
+// The tempting alternative — reserve five bytes up front and return batch[k:]
+// with the header written right-aligned — is wrong here. pack calls Frame on its
+// reused scratch buffer and keeps the result, so a re-sliced return advances the
+// buffer's start by k on every batch and the buffer grows without bound.
+func (msgpackEncoder) Frame(batch []byte, n int) []byte {
+	var hdr [5]byte
+	var w int
+	switch {
+	case n < 16:
+		// fixarray. Also the n == 0 case: unreachable through the sender, which
+		// never frames an empty batch, but 0x90 is an empty array and needs no
+		// precondition to explain.
+		hdr[0], w = 0x90|byte(n), 1
+	case n < 1<<16:
+		hdr[0], w = 0xdc, 3
+		binary.BigEndian.PutUint16(hdr[1:], uint16(n))
+	default:
+		hdr[0], w = 0xdd, 5
+		binary.BigEndian.PutUint32(hdr[1:], uint32(n))
+	}
+
+	batch = append(batch, hdr[:w]...) // grow by the header width
+	copy(batch[w:], batch)            // shift the records right; copy is memmove
+	copy(batch[:w], hdr[:w])
+	return batch
+}
+
+func (e msgpackEncoder) AppendRecord(dst []byte, v map[string]any) ([]byte, error) {
+	b, err := e.marshal(v)
+	if err != nil {
+		// dst is untouched: nothing is appended until marshalling has succeeded.
+		return dst, err
+	}
+	// A record must be a map, because Frame wraps the batch in an array and the
+	// ingestion API expects an array of objects. Nothing in the type system says
+	// so — MsgPack(json.Marshal) compiles — and the failure without this check is
+	// a 406 from the server on every batch, which is a poor way to learn.
+	if err := checkMsgPackMap(b); err != nil {
+		return dst, err
+	}
+	return append(dst, b...), nil
+}
+
+func checkMsgPackMap(b []byte) error {
+	if len(b) == 0 {
+		return errors.New("betterstack: Marshaler returned no bytes")
+	}
+	// fixmap, map16, map32.
+	if c := b[0]; (c&0xf0) == 0x80 || c == 0xde || c == 0xdf {
+		return nil
+	}
+	return fmt.Errorf("betterstack: Marshaler produced 0x%02x, not a MessagePack map; "+
+		"MsgPack needs a MessagePack codec", b[0])
 }
 
 type pooledJSONEncoder struct {

@@ -66,6 +66,7 @@
 // Records are sent as newline-delimited JSON, gzip-compressed, to
 // [DefaultEndpoint]. Attributes are nested under "context"; see
 // [DefaultConverter] for the record shape and [WithContextKey] to change or
-// flatten the nesting. [JSONArray] sends a JSON array instead, and
-// [WithEncoder] takes any other implementation of [Encoder].
+// flatten the nesting. [JSONArray] sends a JSON array instead, [MsgPack] sends
+// MessagePack using a codec you supply, and [WithEncoder] takes any other
+// implementation of [Encoder].
 package betterstack
