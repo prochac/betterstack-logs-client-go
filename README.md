@@ -199,6 +199,36 @@ Everything runs — conversion, encoding, batching, framing, compression, `Flush
 dry-run client needs no source token, since not having one is the point.
 Everything else is validated exactly as usual.
 
+## Logging to more than one place
+
+Shipping to Better Stack *and* printing to the terminal is the usual want in
+development. There is deliberately no option for it here: it is composition, and
+`log/slog` does it.
+
+```go
+logger := slog.New(slog.NewMultiHandler(
+        betterstack.NewHandler(client),
+        slog.NewTextHandler(os.Stderr, nil),
+))
+```
+
+`slog.MultiHandler` is Go 1.26. This module supports 1.21, so on an older
+toolchain use [`samber/slog-multi`](https://github.com/samber/slog-multi)'s
+`slogmulti.Fanout`, which predates it and does the same job. Either way it is a
+dependency of your program, not of this one.
+
+Three things worth knowing:
+
+- **Levels stay independent.** `MultiHandler.Handle` re-checks each handler's
+  `Enabled`, so a `Debug` console handler alongside this one — which defaults to
+  `Info` — sends debug records to the console only. Nothing extra is shipped and
+  nothing is filtered twice.
+- **The console handler is not slowed down.** `Handle` here converts, encodes and
+  queues; it never touches the network, so the handler beside it is not waiting
+  on an upload.
+- **The lifecycle does not move.** The client is still yours to `Close`, and
+  composing handlers does not change that.
+
 ## Example
 
 [`example/`](./example) is a small HTTP service that puts the pieces together:

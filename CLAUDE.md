@@ -20,7 +20,9 @@ Sections of DESIGN.md marked **[amended]** were corrected during implementation,
 
 **v0.2 is complete**: 413 batch splitting (and the local hard-limit check splits too), `WithExtraFields`, `WithFilter`, `WithDryRun`, `WithRetryCeiling`, the `JSONArray` encoder, and `README.md`. "Separate connect/request timeouts", listed under v0.2 in DESIGN §10, had in fact shipped with v0.1's transport. `Encoder.AppendRecord` lost its `index` parameter — see DESIGN §4's amendment before reinstating it.
 
-**v0.3 is in progress.** `example/` has landed — a runnable HTTP service demonstrating context extraction and graceful shutdown, verified against a local sink. Still to do: MessagePack, burst protection, mirroring to a second `slog.Handler`. Benchmarks were listed under v0.3 but shipped with v0.1; DESIGN §10 records that.
+**v0.3 is in progress.** `example/` has landed — a runnable HTTP service demonstrating context extraction and graceful shutdown, verified against a local sink. Still to do: **MessagePack** and **burst protection**.
+
+Two items left v0.3 rather than being implemented, both recorded in DESIGN §10: benchmarks were listed there but shipped with v0.1, and **mirroring to a second `slog.Handler` is struck** — `slog.MultiHandler` (Go 1.26) and `samber/slog-multi` already do it, and reimplementing it inside the handler would duplicate the `log/slog` contract surface for no new capability. Do not add a `WithMirror`; README's "Logging to more than one place" is the answer.
 
 ## Commands
 

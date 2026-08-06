@@ -372,6 +372,18 @@ The greenfield rewrite only buys clean licensing if no source is copied.
 
 **v0.2 — parity.** 413 splitting, `ExtraFields`, send-time filter, dry-run, separate connect/request timeouts, JSON-array encoder, README with the full options table. **[amended]** Also `WithRetryCeiling`, which §5 assigned here without §10 listing it. Separate connect/request timeouts in fact shipped in v0.1, with the transport.
 
-**v0.3 — polish.** MessagePack, burst protection, mirroring to a second `slog.Handler`, `example/` covering context extraction and graceful shutdown — the example has landed, the other three have not. **[amended]** Benchmarks were listed here but shipped with v0.1: `bench_test.go` covers `Handle` (bare, attrs, groups, source, error, disabled, parallel), `Enqueue`, `AppendRecord`, batch assembly, `compress` and `Flush`. Same case as v0.2's connect/request timeouts — an item ticked before the milestone that claimed it.
+**v0.3 — polish.** MessagePack and burst protection, plus `example/` covering context extraction and graceful shutdown. The example has landed; the other two have not.
+
+**[amended]** Benchmarks were listed here but shipped with v0.1: `bench_test.go` covers `Handle` (bare, attrs, groups, source, error, disabled, parallel), `Enqueue`, `AppendRecord`, batch assembly, `compress` and `Flush`. Same case as v0.2's connect/request timeouts — an item ticked before the milestone that claimed it.
+
+**[amended] Mirroring to a second `slog.Handler` is struck, not deferred.** It was to be a handler option answering the JavaScript client's `sendLogsToConsoleOutput` (PARITY §5). It is composition, and it belongs outside this library:
+
+- `slog.MultiHandler` (Go 1.26, proposal #65954) does exactly this, and `samber/slog-multi` has done it since before that. Neither is a dependency *this* module takes; both are one line in the user's `main`. An option here would duplicate them and nothing more.
+- Duplicating them is not free. A mirror inside the handler has to answer what `Enabled` reports when the two disagree on level, whether a failing mirror suppresses the Better Stack record, and how `WithAttrs`/`WithGroup` fan out — the same `log/slog` contract surface §6 and the `slogtest` suite exist to get right *once*. Getting it right twice, in a second place, for no new capability, is a bad trade against §2's small exported surface.
+- The one thing composition cannot give is the *bytes actually sent*, as opposed to the same record independently formatted. That is a debugging need, and `example/`'s `-endpoint` covers it by pointing the client at a local sink — no API at all.
+
+The kill-switch half of the same PARITY line, JavaScript's `sendLogsToBetterStack`, is unaffected: it shipped in v0.2 as `WithDryRun`.
+
+Instead, README documents the composition, since "also print to the console in development" is a real need and the answer should be written down rather than merely implied.
 
 Open questions for Better Stack, none blocking: the `context` vs `extra` key, whether library identity belongs in the payload or only in `User-Agent`, and confirmation that undocumented `Content-Encoding: gzip` is contractual rather than incidental.
