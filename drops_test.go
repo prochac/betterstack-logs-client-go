@@ -137,6 +137,42 @@ func TestCloseReportsFinalDropSummary(t *testing.T) {
 	}
 }
 
+// Burst drops go through the same aggregation as every other drop reason. The
+// JavaScript client prints a console line per window instead; here the periodic
+// summary already exists and reporting one callback per refused record is the
+// error storm it was built to prevent.
+func TestBurstDropsAreSummarised(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, errs := newTestClient(t, rec,
+		WithBatchSize(1000),
+		WithBurstProtection(4, time.Hour),
+	)
+
+	enqueueN(t, c, 100)
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	var summary *DropError
+	for _, err := range errs.all() {
+		var de *DropError
+		if errors.As(err, &de) && de.Reason == DropBurst {
+			summary = de
+		}
+	}
+	if summary == nil {
+		t.Fatalf("Close emitted no burst drop summary: %v", errs.all())
+	}
+	if summary.Records != 96 {
+		t.Errorf("summary reported %d records, want 96", summary.Records)
+	}
+	if got := c.Stats().DroppedBurst; uint64(summary.Records) != got {
+		t.Errorf("summary reported %d records, Stats says %d", summary.Records, got)
+	}
+}
+
 // The final summary must not fire when nothing was lost.
 func TestCloseIsQuietWhenNothingDropped(t *testing.T) {
 	t.Parallel()

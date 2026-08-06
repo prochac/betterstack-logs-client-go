@@ -77,10 +77,15 @@ here blocks the caller on the network.
   time they happen `Handle` has long since returned, and reporting a logging
   failure through the logger would recurse. Drops arrive as periodic aggregated
   summaries rather than one callback per lost record.
+- `WithBurstProtection` is the other half of that, and is **off by default**: it
+  caps how fast records are admitted at all, before they are encoded, so a
+  runaway loop inside a hot path costs an atomic load per record instead of a
+  JSON marshal. The queue only bounds memory, and only once the burst has
+  already been paid for.
 - `Client.Stats()` accounts for every record. After `Close` returns:
 
   ```
-  Enqueued == Sent + DroppedQueueFull + DroppedBacklog +
+  Enqueued == Sent + DroppedQueueFull + DroppedBurst + DroppedBacklog +
               DroppedRejected + DroppedOversize + DroppedClosed
   ```
 
@@ -100,6 +105,7 @@ dropped.
 | `WithBatchInterval(time.Duration)` | `1s` | how long a partial batch waits; the timer starts on the batch's first record, so an idle client does no work |
 | `WithMaxBatchBytes(int)` | `5 MiB` | uncompressed assembly cap, not the API's limit |
 | `WithMaxQueueSize(int)` | `100000` | records; the queue is where backpressure is shed |
+| `WithBurstProtection(int, time.Duration)` | disabled | at most *n* records per window, refused before encoding; the JavaScript client's `10000` per `5s` is a reasonable starting point |
 | `WithMaxRetries(int)` | `5` | retries **after** the first attempt, so at most 6 requests; `0` means send once |
 | `WithRetryBackoff(time.Duration)` | `300ms` | base delay, exponential with full jitter |
 | `WithRetryCeiling(time.Duration)` | `60s` | total time one batch may spend across all attempts |

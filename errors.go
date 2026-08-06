@@ -85,6 +85,10 @@ const (
 	// DropClosed means the records were enqueued after Close, or were still
 	// queued when Close returned.
 	DropClosed
+	// DropBurst means the records were over the WithBurstProtection rate
+	// limit. Appended last: the constants are iota-based, so inserting one
+	// would silently renumber the reasons a caller has already stored.
+	DropBurst
 )
 
 func (r DropReason) String() string {
@@ -99,6 +103,8 @@ func (r DropReason) String() string {
 		return "over the size limit"
 	case DropClosed:
 		return "client closed"
+	case DropBurst:
+		return "over the burst limit"
 	default:
 		return fmt.Sprintf("DropReason(%d)", int(r))
 	}

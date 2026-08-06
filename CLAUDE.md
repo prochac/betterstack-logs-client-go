@@ -20,7 +20,7 @@ Sections of DESIGN.md marked **[amended]** were corrected during implementation,
 
 **v0.2 is complete**: 413 batch splitting (and the local hard-limit check splits too), `WithExtraFields`, `WithFilter`, `WithDryRun`, `WithRetryCeiling`, the `JSONArray` encoder, and `README.md`. "Separate connect/request timeouts", listed under v0.2 in DESIGN §10, had in fact shipped with v0.1's transport. `Encoder.AppendRecord` lost its `index` parameter — see DESIGN §4's amendment before reinstating it.
 
-**v0.3 is in progress.** `example/` has landed — a runnable HTTP service demonstrating context extraction and graceful shutdown, verified against a local sink. Still to do: **MessagePack** and **burst protection**.
+**v0.3 is in progress.** `example/` has landed — a runnable HTTP service demonstrating context extraction and graceful shutdown, verified against a local sink. **Burst protection** has landed too, as `WithBurstProtection(max, window)`: a token bucket in `limiter.go`, checked in `Enqueue` *before* the encode, counted `DroppedBurst`. DESIGN §10 named it but never specified it; §2 and §3 now carry the spec, including why it is **opt-in** where every other option ships the sibling clients' default. Still to do: **MessagePack**.
 
 Two items left v0.3 rather than being implemented, both recorded in DESIGN §10: benchmarks were listed there but shipped with v0.1, and **mirroring to a second `slog.Handler` is struck** — `slog.MultiHandler` (Go 1.26) and `samber/slog-multi` already do it, and reimplementing it inside the handler would duplicate the `log/slog` contract surface for no new capability. Do not add a `WithMirror`; README's "Logging to more than one place" is the answer.
 
@@ -51,6 +51,7 @@ One package, standard library only. `go.uber.org/goleak` is the sole dependency 
 - **`attr.go`** — the attribute half of the `log/slog` contract: `groupOrAttrs` accumulation, the recursive `appendAttr`, group materialisation, source resolution, context extraction.
 - **`converter.go`** — `Converter`, `DefaultConverter`, the reserved payload keys, the record shape.
 - **`encoder.go`** — the `Encoder` interface and the NDJSON and JSON-array implementations, over one shared pool of `*json.Encoder`s.
+- **`limiter.go`** — `WithBurstProtection`'s token bucket, held as a single monotone timestamp in one `atomic.Int64`. Unexported in full. Its `now` field is a clock seam, and it exists so the tests are deterministic rather than timed.
 - **`errors.go`**, **`version.go`**, **`doc.go`** — error types and the `OnError` funnel; `User-Agent` from build info; the package doc.
 
 ## Invariants — do not break these silently
@@ -61,12 +62,12 @@ Each of these was arrived at the hard way, and several have a test whose only jo
 2. **`flushC` is unbuffered.** That is what makes `Flush` racing `Close` return `ErrClosed` instead of hanging on a request nobody will read.
 3. **A batch owns its bytes.** The sender reuses both the accumulation buffer and the gzip output buffer, so `flush` copies before dispatch. The fork could hand its reused buffer straight to a send only because that send was synchronous.
 4. **No `gzip.Writer` is ever shared.** The buffers live in a `packer`, owned by exactly one goroutine: the sender has one, and an upload worker builds its own lazily the first time a 413 makes it split. Compression is otherwise the sender's alone — in the workers it would be a data race. The split path is the sole exception, and it cannot be avoided: handing the halves back to the sender would deadlock, since the sender's dispatch blocks on the pool the worker occupies.
-5. **Backpressure is shed at the queue, and nowhere else.** The batch hand-off blocks. An earlier version dropped there instead and lost ~20% of an ordinary 1000-record burst against a healthy server.
+5. **Backpressure is shed at the queue, and nowhere else.** The batch hand-off blocks. An earlier version dropped there instead and lost ~20% of an ordinary 1000-record burst against a healthy server. `WithBurstProtection` is not a counter-example: backpressure is shedding because the *downstream* cannot keep up, and there is still exactly one of those. The limiter is an admission ceiling the operator declares, enforced whether or not delivery is healthy, and off unless asked for.
 6. **`Enqueue` never blocks and never returns an error for a dropped record.** Drops are counted and aggregated into `OnError` summaries. Returning them would fire error middleware once per lost record, which is the storm the aggregation exists to prevent.
 7. **`Handle` does no I/O**, and its error is local only: an encoding failure or `ErrClosed`.
 8. **Statuses are terminal by default.** Only 408, 429, 5xx and network errors retry. 401 is terminal — that is what the live endpoint actually returns for a bad token, despite the docs naming 403. **413 is terminal but not fatal**: the same bytes are never resent, yet the records are not abandoned — the batch is halved and both pieces sent. Do not move 413 into `isRetryable` to express that; splitting is a separate mechanism, and conflating them makes a loop.
 9. **A record's encoding is self-delimiting and position-independent.** `Enqueue` encodes one record at a time, before it is known which batch it will join, and a split re-frames the same bytes into a different batch. This is why `AppendRecord` has no index and why `JSONArray` puts the comma *before* each record for `Frame` to overwrite.
-10. **The stats identity holds after `Close`**: `Enqueued == Sent + all Dropped*`. `TestStatsBalance` asserts it across healthy, rejected, exhausted, splitting, dry-run and overflowing runs.
+10. **The stats identity holds after `Close`**: `Enqueued == Sent + all Dropped*`. `TestStatsBalance` asserts it across healthy, rejected, exhausted, splitting, dry-run, overflowing and burst-limited runs. A new drop reason means touching seven places — `Stats`, `counters`, `snapshot`, the `DropReason` iota (append, never insert), `dropSnapshot`, `reportDrops` and `reportFinalDrops` — plus `assertStatsBalance` and `example/`'s `printStats`, which recompute the identity by hand.
 11. **`OnError` may be called concurrently**, from the sender and from every upload worker, and a panic inside it must not escape `safeReport`.
 
 ## Testing

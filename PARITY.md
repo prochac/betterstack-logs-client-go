@@ -128,7 +128,7 @@ Ordered by what blocks adoption. Current state is one goroutine + one `http.Clie
 - [ ] **Send-time filter hook.** Ruby's `filter_sent_to_better_stack`. A `func(record) bool` predicate, distinct from level filtering.
 - [ ] **Console mirroring + kill switch.** JS `sendLogsToConsoleOutput` / `sendLogsToBetterStack`. Cheap, and makes local dev and tests sane.
 - [ ] **User-Agent.** Currently sends the bare `name` const (`handler.go:145`); the convention is `<lib>/<version>`, cf. `logtail-js(node)`.
-- [ ] **Burst protection.** JS-only (`10000` logs / `5000` ms). Lowest priority — the bounded queue covers most of the same failure.
+- [x] **Burst protection.** JS-only (`10000` logs / `5000` ms). Lowest priority — the bounded queue covers most of the same failure. Shipped in v0.3 as `WithBurstProtection(max, window)`, **opt-in rather than defaulted** (DESIGN §2): JS's ceiling is calibrated for Node, and silently capping a Go service at 2 000 rec/s would be a surprise. "Most of the same failure" proved the right qualifier — the queue bounds memory but only after every record it drops has been encoded, and it never engages while delivery is healthy.
 
 ### Wire-shape questions to settle
 

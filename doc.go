@@ -38,6 +38,11 @@
 // application outruns delivery, records are dropped at the queue and counted,
 // never blocked. Size the queue with [WithMaxQueueSize].
 //
+// [WithBurstProtection] caps the rate at which records are admitted at all, and
+// is off by default. It refuses before the encode, so a runaway loop costs an
+// atomic load per record rather than a JSON marshal; the queue only bounds
+// memory, and only once that marshal has already been paid for.
+//
 // Delivery failures cannot be reported through Handle's error return, because
 // by the time they happen Handle has long since returned — and reporting a
 // logging failure through the logger would recurse. They go to the [WithOnError]

@@ -433,12 +433,76 @@ func TestQueueFullDropsWithoutBlocking(t *testing.T) {
 	}
 }
 
+// --- burst protection -------------------------------------------------------
+
+// A window of an hour makes the limit a plain count for the duration of the
+// test: the bucket starts full and never refills, so exactly the burst size
+// gets through and everything after it is refused.
+func TestBurstProtectionDropsOverTheLimit(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, _ := newTestClient(t, rec,
+		WithBatchSize(5),
+		WithBurstProtection(10, time.Hour),
+	)
+	defer c.Close()
+
+	enqueueN(t, c, 100)
+	if err := c.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	stats := c.Stats()
+	if stats.Enqueued != 100 {
+		t.Errorf("Stats().Enqueued = %d, want 100: a refused record was still offered", stats.Enqueued)
+	}
+	if stats.DroppedBurst != 90 {
+		t.Errorf("Stats().DroppedBurst = %d, want 90", stats.DroppedBurst)
+	}
+	if stats.Sent != 10 {
+		t.Errorf("Stats().Sent = %d, want 10", stats.Sent)
+	}
+	if got := len(rec.accepted()); got != 10 {
+		t.Errorf("the endpoint received %d records, want 10", got)
+	}
+}
+
+// The limiter runs before the encoder, which is the entire point: a burst that
+// is going to be dropped must not first be marshalled. An event holding a value
+// no JSON encoder can take proves the order — Enqueue returns nil, so the
+// encoder was never reached.
+func TestBurstProtectionRefusesBeforeEncoding(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, _ := newTestClient(t, rec, WithBurstProtection(1, time.Hour))
+	defer c.Close()
+
+	unencodable := map[string]any{KeyMessage: "nope", "ch": make(chan int)}
+
+	// Sanity: while budget remains, the event reaches the encoder and is
+	// rejected by it.
+	if err := c.Enqueue(unencodable); err == nil {
+		t.Fatal("Enqueue accepted an unencodable event")
+	}
+
+	// The offer above consumed the only slot in the bucket, so the next one is
+	// refused by the limiter and never reaches the encoder.
+	if err := c.Enqueue(unencodable); err != nil {
+		t.Errorf("Enqueue = %v, want nil: the record should have been refused before encoding", err)
+	}
+	if got := c.Stats().DroppedBurst; got != 1 {
+		t.Errorf("Stats().DroppedBurst = %d, want 1", got)
+	}
+}
+
 // Once Close has returned, every record handed to Enqueue is accounted for
 // exactly once.
 func assertStatsBalance(t *testing.T, c *Client) {
 	t.Helper()
 	s := c.Stats()
-	accounted := s.Sent + s.DroppedQueueFull + s.DroppedBacklog +
+	accounted := s.Sent + s.DroppedQueueFull + s.DroppedBurst + s.DroppedBacklog +
 		s.DroppedRejected + s.DroppedOversize + s.DroppedClosed
 	if accounted != s.Enqueued {
 		t.Errorf("stats do not balance: enqueued %d, accounted %d (%+v)", s.Enqueued, accounted, s)
@@ -536,6 +600,23 @@ func TestStatsBalance(t *testing.T) {
 		_ = c.Close()
 		assertStatsBalance(t, c)
 	})
+
+	t.Run("under burst protection", func(t *testing.T) {
+		t.Parallel()
+		rec := newRecorder(t)
+		c, _ := newTestClient(t, rec,
+			WithBatchSize(10),
+			WithBurstProtection(10, time.Hour),
+		)
+		enqueueN(t, c, 100)
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		assertStatsBalance(t, c)
+		if got := c.Stats().DroppedBurst; got != 90 {
+			t.Errorf("DroppedBurst = %d, want 90", got)
+		}
+	})
 }
 
 // --- construction -----------------------------------------------------------
@@ -562,6 +643,9 @@ func TestNewClientValidation(t *testing.T) {
 		{"negative retries", testToken, []ClientOption{WithMaxRetries(-1)}, "WithMaxRetries"},
 		{"zero batch interval", testToken, []ClientOption{WithBatchInterval(0)}, "WithBatchInterval"},
 		{"negative timeout", testToken, []ClientOption{WithTimeout(-time.Second)}, "WithTimeout"},
+		{"burst maximum without a window", testToken, []ClientOption{WithBurstProtection(10, 0)}, "WithBurstProtection"},
+		{"burst window without a maximum", testToken, []ClientOption{WithBurstProtection(0, time.Second)}, "WithBurstProtection"},
+		{"negative burst maximum", testToken, []ClientOption{WithBurstProtection(-1, -time.Second)}, "WithBurstProtection"},
 	}
 
 	for _, tt := range tests {

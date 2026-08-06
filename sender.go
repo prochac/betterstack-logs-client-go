@@ -36,7 +36,7 @@ type sender struct {
 }
 
 type dropSnapshot struct {
-	queueFull, backlog, rejected, oversize, closed uint64
+	queueFull, burst, backlog, rejected, oversize, closed uint64
 }
 
 func newSender(c *Client) *sender {
@@ -249,6 +249,7 @@ func (s *sender) maybeReportDrops() {
 func (s *sender) reportDrops() {
 	cur := dropSnapshot{
 		queueFull: s.c.stats.droppedQueueFull.Load(),
+		burst:     s.c.stats.droppedBurst.Load(),
 		backlog:   s.c.stats.droppedBacklog.Load(),
 		rejected:  s.c.stats.droppedRejected.Load(),
 		oversize:  s.c.stats.droppedOversize.Load(),
@@ -260,6 +261,7 @@ func (s *sender) reportDrops() {
 		cur, prev uint64
 	}{
 		{DropQueueFull, cur.queueFull, s.reported.queueFull},
+		{DropBurst, cur.burst, s.reported.burst},
 		{DropBacklog, cur.backlog, s.reported.backlog},
 		{DropOversize, cur.oversize, s.reported.oversize},
 		{DropClosed, cur.closed, s.reported.closed},
@@ -439,6 +441,7 @@ func (c *Client) reportFinalDrops() {
 		n      uint64
 	}{
 		{DropQueueFull, s.DroppedQueueFull},
+		{DropBurst, s.DroppedBurst},
 		{DropBacklog, s.DroppedBacklog},
 		{DropOversize, s.DroppedOversize},
 		{DropClosed, s.DroppedClosed},

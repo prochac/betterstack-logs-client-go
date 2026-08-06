@@ -83,8 +83,8 @@ const (
 //
 // Once Close has returned, the counts satisfy
 //
-//	Enqueued == Sent + DroppedQueueFull + DroppedBacklog + DroppedRejected +
-//	            DroppedOversize + DroppedClosed
+//	Enqueued == Sent + DroppedQueueFull + DroppedBurst + DroppedBacklog +
+//	            DroppedRejected + DroppedOversize + DroppedClosed
 //
 // so no record is unaccounted for and no drop is silent.
 //
@@ -99,6 +99,7 @@ type Stats struct {
 	Retries  uint64 // upload attempts after the first
 
 	DroppedQueueFull uint64 // the application outran the sender
+	DroppedBurst     uint64 // over the WithBurstProtection rate limit
 	DroppedBacklog   uint64 // every upload slot busy and the hand-off full
 	DroppedRejected  uint64 // terminal status, or the retry budget ran out
 	DroppedOversize  uint64 // over the hard request size limit, or a 413
@@ -114,6 +115,7 @@ type counters struct {
 	retries  atomic.Uint64
 
 	droppedQueueFull atomic.Uint64
+	droppedBurst     atomic.Uint64
 	droppedBacklog   atomic.Uint64
 	droppedRejected  atomic.Uint64
 	droppedOversize  atomic.Uint64
@@ -126,6 +128,7 @@ func (c *counters) snapshot() Stats {
 		Sent:             c.sent.Load(),
 		Retries:          c.retries.Load(),
 		DroppedQueueFull: c.droppedQueueFull.Load(),
+		DroppedBurst:     c.droppedBurst.Load(),
 		DroppedBacklog:   c.droppedBacklog.Load(),
 		DroppedRejected:  c.droppedRejected.Load(),
 		DroppedOversize:  c.droppedOversize.Load(),
@@ -140,6 +143,8 @@ type clientConfig struct {
 	batchInterval   time.Duration
 	maxBatchBytes   int
 	maxQueueSize    int
+	burstMax        int           // 0 = burst protection disabled
+	burstWindow     time.Duration // 0 = burst protection disabled
 	maxRetries      int
 	retryBackoff    time.Duration
 	retryCeiling    time.Duration
@@ -197,6 +202,30 @@ func WithMaxBatchBytes(n int) ClientOption {
 // 100000, matching the Java client.
 func WithMaxQueueSize(n int) ClientOption {
 	return func(c *clientConfig) { c.maxQueueSize = n }
+}
+
+// WithBurstProtection caps how fast records are admitted at all: at most
+// maxRecords per window, with a full window's worth admissible back to back.
+// Records over the limit are dropped and counted DroppedBurst. Disabled by
+// default; WithBurstProtection(0, 0) disables it again.
+//
+// This is a different limit from WithMaxQueueSize, not a smaller one. The queue
+// sheds when the sender falls behind, so it engages only once the pipeline is
+// saturated — and by then every dropped record has already been converted and
+// encoded on the calling goroutine. Burst protection is a ceiling the operator
+// chooses, applied before that work happens, so a runaway loop logging inside a
+// hot path costs one atomic load per record rather than a JSON encode.
+//
+// It is off by default because the right ceiling is a property of the
+// application, not of the library, and a limit guessed on the application's
+// behalf would drop its logs without being asked. The JavaScript client, the
+// only official one with this feature, ships 10000 records per 5s; that is a
+// reasonable starting point, and a deliberately conservative one for Go.
+func WithBurstProtection(maxRecords int, window time.Duration) ClientOption {
+	return func(c *clientConfig) {
+		c.burstMax = maxRecords
+		c.burstWindow = window
+	}
 }
 
 // WithMaxRetries sets how many times a failed upload is retried after the
@@ -356,6 +385,8 @@ type Client struct {
 	queue  chan []byte    // invariant 1: never closed
 	flushC chan *flushReq // invariants 1 and 2: unbuffered, never closed
 
+	limiter *limiter // nil unless WithBurstProtection was given
+
 	done       chan struct{} // closed first by Close: Enqueue starts refusing
 	shutdown   chan struct{} // closed after the final flush: the sender exits
 	senderDone chan struct{} // closed by the sender on its way out
@@ -419,6 +450,12 @@ func NewClient(sourceToken string, opts ...ClientOption) (*Client, error) {
 		done:       make(chan struct{}),
 		shutdown:   make(chan struct{}),
 		senderDone: make(chan struct{}),
+	}
+
+	// Left nil when unconfigured, so the default path through Enqueue pays one
+	// predictable branch and never reads a clock.
+	if cfg.burstMax > 0 {
+		c.limiter = newLimiter(cfg.burstMax, cfg.burstWindow)
 	}
 
 	if cfg.httpClient != nil {
@@ -486,6 +523,14 @@ func (cfg *clientConfig) validate() error {
 	if cfg.retryBackoff < 0 {
 		return fmt.Errorf("betterstack: WithRetryBackoff(%v) must not be negative", cfg.retryBackoff)
 	}
+	// Burst protection is the one option that is legitimately zero — that is
+	// how it stays off — so it cannot join either table above. Half of it is
+	// never meaningful: a maximum without a window has no rate in it, and a
+	// window without a maximum has nothing to limit.
+	if (cfg.burstMax > 0) != (cfg.burstWindow > 0) || cfg.burstMax < 0 || cfg.burstWindow < 0 {
+		return fmt.Errorf("betterstack: WithBurstProtection(%d, %v) needs both a positive maximum and a positive window, or neither",
+			cfg.burstMax, cfg.burstWindow)
+	}
 	return nil
 }
 
@@ -493,7 +538,9 @@ func (cfg *clientConfig) validate() error {
 //
 // It never blocks on the network and never blocks on a full queue: if the
 // application is producing records faster than they can be shipped, the record
-// is dropped and counted rather than stalling the caller.
+// is dropped and counted rather than stalling the caller. WithBurstProtection,
+// if configured, drops the record earlier still and for a different reason —
+// over the operator's rate ceiling, whether or not delivery is keeping up.
 //
 // The returned error is local only — an encoding failure, or ErrClosed after
 // Close. A dropped record is not an error return: doing that would report every
@@ -511,6 +558,15 @@ func (c *Client) Enqueue(event map[string]any) error {
 		c.stats.droppedClosed.Add(1)
 		return ErrClosed
 	default:
+	}
+
+	// Before the encode, deliberately: refusing a record here is meant to cost
+	// one atomic load, not a JSON marshal. Counted as both offered and dropped
+	// for the same reason as the branch above.
+	if c.limiter != nil && !c.limiter.allow() {
+		c.stats.enqueued.Add(1)
+		c.stats.droppedBurst.Add(1)
+		return nil
 	}
 
 	// Encoding happens here, on the caller's goroutine. Encoding errors are

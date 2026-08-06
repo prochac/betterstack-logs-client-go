@@ -70,6 +70,7 @@ Separate `ClientOption` and `HandlerOption` types so the compiler enforces which
 | `WithBatchInterval(time.Duration)` | `1s` | JS; Java is 3 s, and 1 s is the better single-timer value (PARITY §4) |
 | `WithMaxBatchBytes(int)` | `5 MiB` | conservative against the 10 MiB compressed limit |
 | `WithMaxQueueSize(int)` | `100_000` records | Java `maxQueueSize`, drop over |
+| `WithBurstProtection(int, time.Duration)` | disabled | JS `burstProtectionMax` / `burstProtectionMilliseconds`, `10_000` / `5s` (PARITY §2) |
 | `WithMaxRetries(int)` | `5` | Java |
 | `WithRetryBackoff(time.Duration)` | `300ms` base | Java |
 | `WithRetryCeiling(time.Duration)` | `60s` | total elapsed per batch; OTel `otlploghttp` (§5) |
@@ -82,6 +83,10 @@ Separate `ClientOption` and `HandlerOption` types so the compiler enforces which
 | `WithOnError(func(error))` | write to `os.Stderr` | PARITY §5 |
 | `WithShutdownTimeout(time.Duration)` | `15s` | used by `Close` |
 | `WithDryRun(bool)` | `false` | JS `sendLogsToBetterStack` kill switch |
+
+**[amended] `WithBurstProtection` is off by default**, where every other option ships the sibling clients' number. JavaScript is the only official client with the feature and enables it at 10 000 records per 5 s — a 2 000 rec/s ceiling calibrated for Node's throughput, which a Go service can exceed without anything being wrong. A default that silently discards a correctly-behaving application's logs is the same class of surprise as a default level of `Debug`, and §2 has already rejected that. The right ceiling is a property of the application, so the library declines to guess one and the docs quote JS's numbers as a starting point instead.
+
+The two values are one option, not two. Neither means anything alone — a maximum without a window has no rate in it, a window without a maximum has nothing to limit — so a single call makes the half-configured state unrepresentable rather than merely invalid. `validate` still rejects it, because `WithBurstProtection(10_000, 0)` is a plausible typo.
 
 **[amended]** `WithDryRun(true)` **waives the source-token check** and nothing else. The whole pipeline still runs — convert, encode, queue, batch, frame, compress, `Flush`, `Close` — and the records are counted as `Sent`; only the POST is skipped. Requiring a credential for the one mode whose purpose is not spending one would defeat it, and the mode exists for tests and local development, where there is no token to give. Every other setting is validated exactly as usual, so turning the switch off later cannot surface a configuration error that was hidden while it was on.
 
@@ -147,6 +152,14 @@ Handle (caller goroutine)      queue          sender goroutine        upload wor
 Blocking instead propagates backpressure to the queue, which is where records are meant to be shed: it is explicitly sized by the caller (`MaxQueueSize`), it drops with an accurate count, and `Enqueue` still never blocks the application. Assembling batches that have nowhere to go only moves unbounded memory from the queue, where it is bounded and accounted, into a backlog where it is neither. There is exactly one shedding point, and the user chooses its size.
 
 The wait is bounded by a context — the caller's for an explicit `Flush`, the client's worker context otherwise — so `Close` can cancel a sender parked on a stalled upload. `DroppedBacklog` survives as the counter for that cancellation path.
+
+**[amended] `WithBurstProtection` adds a second place records are shed, and does not contradict the rule above.** That rule is about **backpressure**: shedding because the downstream cannot keep up. There is still exactly one of those, the queue. Burst protection is an **admission ceiling** — a rate the operator declares acceptable, enforced whether or not delivery is keeping up at all, and off unless asked for. The two answer different questions: the queue asks "is the sender behind?", the limiter asks "is this more than I agreed to send?". A client with the limiter disabled, which is every client that has not opted in, behaves exactly as described above.
+
+It sits in `Enqueue`, **before the encode**, which is the entire reason for having it. The queue only fills once a burst has already been converted and marshalled on the calling goroutine, so it bounds memory but not the CPU that a runaway loop inside a hot path burns. Refusing at the gate costs one atomic load. The limiter is a token bucket held as a single monotone timestamp — the theoretical arrival time, with the emission interval `window/max` and the burst tolerance `window` — so its whole state is one `atomic.Int64`, its refusal path performs no write at all, and it needs no array of window slots (the JS client's shape, PARITY §2). Admitting `k` records back to back requires `k·interval ≤ window`, i.e. exactly `max` of them from a full bucket, which is the steady state the JS numbers describe.
+
+Records refused here are counted `Enqueued` and `DroppedBurst`, exactly as a record refused after `Close` is counted `Enqueued` and `DroppedClosed`, so §5's identity is unaffected. The refusal is not an error return, for the reason in §5: one error per lost record is the storm the aggregation exists to prevent.
+
+It is deliberately not in `Handle`. The handler depends on the unexported `enqueuer` interface rather than on `*Client`, and pushing admission policy behind that interface would put client policy inside the `log/slog` contract surface that §2's converter split exists to keep clean. The cost is that a refused record has still paid for attribute conversion; encoding is the larger half, and this saves it.
 
 **[amended] Compression therefore runs on the sender, before dispatch** — not in `transport.go` on the upload workers, as §7's file layout implies. The reusable-`gzip.Writer` justification above is only true where there is a single writer; with ≤`MaxInFlight` concurrent uploads a shared writer is a data race. Compressing first also shrinks the queued-batch memory bound ~8× and means a retry re-sends bytes rather than recompressing them. Level is `gzip.BestSpeed`: log JSON still compresses 8–12× at level 1, and CPU inside the customer's process is the scarce resource.
 
@@ -288,6 +301,7 @@ type Stats struct {
     Enqueued, Sent, Retries uint64
 
     DroppedQueueFull uint64 // queue was full: the app outran the sender
+    DroppedBurst     uint64 // over the WithBurstProtection rate ceiling
     DroppedBacklog   uint64 // all MaxInFlight uploads busy and the hand-off full
     DroppedRejected  uint64 // terminal status, or retry budget exhausted
     DroppedOversize  uint64 // over the hard request limit, or 413
@@ -298,8 +312,9 @@ type Stats struct {
 with the documented identity, which is a test rather than a comment:
 
 ```
-Enqueued == Sent + DroppedQueueFull + DroppedBacklog + DroppedRejected +
-            DroppedOversize + DroppedClosed        (once Close has returned)
+Enqueued == Sent + DroppedQueueFull + DroppedBurst + DroppedBacklog +
+            DroppedRejected + DroppedOversize + DroppedClosed
+                                                   (once Close has returned)
 ```
 
 For that to hold, `Enqueued` counts records **offered** to `Enqueue`, including those refused with `ErrClosed` after `Close` — a record the caller handed over and that never arrived is a drop whether it was refused at the door or lost later. Records rejected with an encoding error are outside the accounting entirely: nothing was ever handed over, and the caller was told synchronously.
@@ -372,7 +387,9 @@ The greenfield rewrite only buys clean licensing if no source is copied.
 
 **v0.2 — parity.** 413 splitting, `ExtraFields`, send-time filter, dry-run, separate connect/request timeouts, JSON-array encoder, README with the full options table. **[amended]** Also `WithRetryCeiling`, which §5 assigned here without §10 listing it. Separate connect/request timeouts in fact shipped in v0.1, with the transport.
 
-**v0.3 — polish.** MessagePack and burst protection, plus `example/` covering context extraction and graceful shutdown. The example has landed; the other two have not.
+**v0.3 — polish.** MessagePack and burst protection, plus `example/` covering context extraction and graceful shutdown. The example and burst protection have landed; MessagePack has not.
+
+**[amended]** Burst protection arrived without a spec — §10 named it and PARITY §2 quoted JavaScript's two numbers, and nothing else in this document said what it should do. §2 and §3 above now carry that spec: opt-in rather than defaulted, one option rather than two, a token bucket in `Enqueue` ahead of the encode, and `DroppedBurst` in the identity. PARITY §3 ranked it "lowest priority — the bounded queue covers most of the same failure", which is right about *most*: the queue bounds memory but only after every record it drops has been encoded, and it never engages at all while delivery is healthy.
 
 **[amended]** Benchmarks were listed here but shipped with v0.1: `bench_test.go` covers `Handle` (bare, attrs, groups, source, error, disabled, parallel), `Enqueue`, `AppendRecord`, batch assembly, `compress` and `Flush`. Same case as v0.2's connect/request timeouts — an item ticked before the milestone that claimed it.
 

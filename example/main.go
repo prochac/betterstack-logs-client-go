@@ -329,14 +329,14 @@ func drive(ctx context.Context, base string) {
 // exactly one countable reason. Records rejected by the filter are in neither
 // column — they never reached the client at all.
 func printStats(s betterstack.Stats) {
-	dropped := s.DroppedQueueFull + s.DroppedBacklog + s.DroppedRejected +
-		s.DroppedOversize + s.DroppedClosed
+	dropped := s.DroppedQueueFull + s.DroppedBurst + s.DroppedBacklog +
+		s.DroppedRejected + s.DroppedOversize + s.DroppedClosed
 
 	fmt.Fprintf(os.Stderr, "\nenqueued=%d sent=%d dropped=%d retries=%d\n",
 		s.Enqueued, s.Sent, dropped, s.Retries)
 	if dropped > 0 {
-		fmt.Fprintf(os.Stderr, "  queue_full=%d backlog=%d rejected=%d oversize=%d closed=%d\n",
-			s.DroppedQueueFull, s.DroppedBacklog, s.DroppedRejected,
+		fmt.Fprintf(os.Stderr, "  queue_full=%d burst=%d backlog=%d rejected=%d oversize=%d closed=%d\n",
+			s.DroppedQueueFull, s.DroppedBurst, s.DroppedBacklog, s.DroppedRejected,
 			s.DroppedOversize, s.DroppedClosed)
 	}
 	if s.Enqueued != s.Sent+dropped {

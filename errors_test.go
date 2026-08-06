@@ -76,6 +76,7 @@ func TestDropErrorMessage(t *testing.T) {
 		{DropRejected, "rejected by ingest"},
 		{DropOversize, "over the size limit"},
 		{DropClosed, "client closed"},
+		{DropBurst, "over the burst limit"},
 	} {
 		err := &DropError{Records: 5, Reason: tt.reason}
 		got := err.Error()

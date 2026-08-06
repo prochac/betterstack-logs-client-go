@@ -160,6 +160,29 @@ func BenchmarkEnqueue(b *testing.B) {
 	}
 }
 
+// BenchmarkEnqueueBurstRefused is the cost of the limiter on the path it exists
+// for: the bucket is empty, so every call is refused. It should be a clock read
+// and an atomic load — cheaper than the encode it replaces, which is the whole
+// argument for gating before the encoder rather than after it.
+func BenchmarkEnqueueBurstRefused(b *testing.B) {
+	c := benchClient(b, WithMaxQueueSize(1<<20), WithBurstProtection(1, time.Hour))
+	ev := map[string]any{
+		KeyMessage: "a log message",
+		KeyLevel:   "INFO",
+		DefaultContextKey: map[string]any{
+			"service": "api",
+			"index":   1,
+		},
+	}
+	_ = c.Enqueue(ev) // drain the one-record bucket
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = c.Enqueue(ev)
+	}
+}
+
 func BenchmarkNDJSONAppendRecord(b *testing.B) {
 	enc := NDJSON()
 	ev := map[string]any{
