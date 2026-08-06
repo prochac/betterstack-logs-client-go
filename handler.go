@@ -59,6 +59,11 @@ func WithLevel(l slog.Leveler) HandlerOption {
 
 // WithAddSource includes the call site of each record, under the "source" key,
 // as function, file and line. Records with no program counter are unaffected.
+//
+// It yields to an attribute the caller keyed "source" themselves, matching what
+// the standard library's handlers effectively do: they write the built-in
+// source first and the record's attrs after it, so the caller's value is the
+// one a last-wins consumer keeps.
 func WithAddSource(add bool) HandlerOption {
 	return func(c *handlerConfig) { c.addSource = add }
 }
@@ -83,6 +88,11 @@ func WithReplaceAttr(f func(groups []string, a slog.Attr) slog.Attr) HandlerOpti
 // any groups opened with WithGroup, because they describe the ambient request
 // rather than the call site. A trace ID stays in the same place regardless of
 // which derived logger emitted the line.
+//
+// They yield on a key collision to anything more specific: an attribute of the
+// same key from the record itself or from a logger's With(...) chain wins,
+// because that is a statement about this one line rather than about the request
+// it happened during. They beat only WithExtraFields.
 func WithAttrFromContext(extractors ...func(context.Context) []slog.Attr) HandlerOption {
 	return func(c *handlerConfig) {
 		c.attrFromContext = append(c.attrFromContext, extractors...)

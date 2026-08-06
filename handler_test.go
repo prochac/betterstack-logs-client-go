@@ -292,6 +292,61 @@ func TestExtraFieldsYieldToRealAttrs(t *testing.T) {
 	}
 }
 
+// A context extractor states a fact about the request; a record or With(...)
+// attribute states one about this single line. The more specific wins.
+func TestContextAttrsYieldToRealAttrs(t *testing.T) {
+	t.Parallel()
+
+	sink := &stubSink{}
+	h := newHandler(sink, WithAttrFromContext(func(context.Context) []slog.Attr {
+		return []slog.Attr{
+			slog.String("trace", "t-1"),
+			slog.String("user", "from-context"),
+			slog.String("region", "from-context"),
+		}
+	}))
+	slog.New(h).With("user", "from-with").Info("hello", slog.String("region", "from-record"))
+
+	ctx := sink.last(t)[DefaultContextKey].(map[string]any)
+	if got := ctx["user"]; got != "from-with" {
+		t.Errorf("user = %v, want %q: a context extractor beat a With attribute", got, "from-with")
+	}
+	if got := ctx["region"]; got != "from-record" {
+		t.Errorf("region = %v, want %q: a context extractor beat a record attribute", got, "from-record")
+	}
+	if got := ctx["trace"]; got != "t-1" {
+		t.Errorf("trace = %v, want %q: an uncontested extracted attribute was lost", got, "t-1")
+	}
+}
+
+// slog permits a key to repeat within one record, and slog.JSONHandler emits it
+// twice (golang/go#59365). Here the tree is a map, so the collision collapses to
+// the last write — which is what makes a call-site attribute override the
+// With(...) chain that produced the logger, and is the resolution every consumer
+// of the payload applies anyway. DESIGN §4, "Duplicate keys".
+func TestDuplicateKeysCollapseToTheLastWrite(t *testing.T) {
+	t.Parallel()
+
+	sink := &stubSink{}
+	log := slog.New(newHandler(sink)).With("k", "from-with")
+	log.Info("hello", slog.String("k", "from-record"), slog.String("k", "from-record-2"))
+
+	ctx := sink.last(t)[DefaultContextKey].(map[string]any)
+	if got := ctx["k"]; got != "from-record-2" {
+		t.Errorf("k = %v, want %q", got, "from-record-2")
+	}
+
+	// And the wire carries it once, whatever the encoder: nothing downstream is
+	// ever asked to resolve a duplicate.
+	line, err := NDJSON().AppendRecord(nil, sink.last(t))
+	if err != nil {
+		t.Fatalf("AppendRecord: %v", err)
+	}
+	if n := bytes.Count(line, []byte(`"k"`)); n != 1 {
+		t.Errorf(`"k" appears %d times on the wire, want 1: %s`, n, line)
+	}
+}
+
 func TestExtraFieldsFlattenWithEmptyContextKey(t *testing.T) {
 	t.Parallel()
 
@@ -588,6 +643,43 @@ func TestAddSource(t *testing.T) {
 			if _, present := ctx[slog.SourceKey]; present {
 				t.Error("source is present for a zero PC")
 			}
+		}
+	})
+
+	// JSONHandler writes its built-in source before the record's attrs, so a
+	// caller who keys an attribute "source" is the one a last-wins consumer
+	// keeps. Emitting both is not open to us, so source yields to reach the same
+	// outcome.
+	t.Run("yields to the caller's own source attribute", func(t *testing.T) {
+		t.Parallel()
+		sink := &stubSink{}
+		h := newHandler(sink, WithAddSource(true))
+
+		slog.New(h).Info("msg", slog.String(slog.SourceKey, "mine"))
+
+		ctx := sink.last(t)[DefaultContextKey].(map[string]any)
+		if got := ctx[slog.SourceKey]; got != "mine" {
+			t.Errorf("source = %v, want %q: the call site beat the caller's own attribute", got, "mine")
+		}
+	})
+
+	// It is still more specific than the two root-placed things below it.
+	t.Run("beats a context extractor and an extra field", func(t *testing.T) {
+		t.Parallel()
+		sink := &stubSink{}
+		h := newHandler(sink,
+			WithAddSource(true),
+			WithAttrFromContext(func(context.Context) []slog.Attr {
+				return []slog.Attr{slog.String(slog.SourceKey, "from-context")}
+			}),
+			WithExtraFields(map[string]any{slog.SourceKey: "from-extra"}),
+		)
+
+		slog.New(h).Info("msg")
+
+		ctx := sink.last(t)[DefaultContextKey].(map[string]any)
+		if _, ok := ctx[slog.SourceKey].(map[string]any); !ok {
+			t.Errorf("source = %v, want the resolved call site", ctx[slog.SourceKey])
 		}
 	})
 }

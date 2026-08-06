@@ -58,10 +58,16 @@ type treeBuilder struct {
 //   - the handler's extra fields, for the same reason, one step more global
 //     still.
 //
-// Those three are applied in increasing order of generality, and extra fields
-// yield to any key already taken. So a record attribute beats a context
-// extractor, which beats an extra field — the more specific statement about
-// this particular line wins.
+// Those three are applied in increasing order of generality, and each of them
+// yields to a key already taken. So a record attribute beats source, which
+// beats a context extractor, which beats an extra field — the more specific
+// statement about this particular line wins.
+//
+// Source yields for the same reason as the rest, and the standard library
+// agrees: JSONHandler writes its built-in source before the record's attrs, so
+// an attribute keyed "source" appears second and, under the last-wins rule that
+// every JSON consumer applies, is the one that survives. Emitting both is not
+// open to us — see DESIGN §4 — so yielding is how the same outcome is reached.
 func (b *treeBuilder) build(goas []groupOrAttrs, ctxAttrs []slog.Attr, r *slog.Record, source map[string]any, extra map[string]any) map[string]any {
 	root := b.walk(goas, nil, func(dst map[string]any, groups []string) {
 		r.Attrs(func(a slog.Attr) bool {
@@ -70,18 +76,23 @@ func (b *treeBuilder) build(goas []groupOrAttrs, ctxAttrs []slog.Attr, r *slog.R
 		})
 	})
 
+	// All three route their attributes through appendAttr rather than writing
+	// them straight into the map, so they get the same value mapping and the
+	// same ReplaceAttr treatment as any other attribute. The one consequence
+	// worth knowing: the taken-check runs before appendAttr, so a ReplaceAttr
+	// that renames keys can defeat it.
+	if source != nil {
+		if _, taken := root[slog.SourceKey]; !taken {
+			b.appendAttr(root, nil, slog.Any(slog.SourceKey, source))
+		}
+	}
 	for _, a := range ctxAttrs {
+		if _, taken := root[a.Key]; taken {
+			continue
+		}
 		b.appendAttr(root, nil, a)
 	}
-	if source != nil {
-		b.appendAttr(root, nil, slog.Any(slog.SourceKey, source))
-	}
 	for k, v := range extra {
-		// Routed through appendAttr rather than written straight into the map,
-		// so an extra field gets the same value mapping and the same
-		// ReplaceAttr treatment as any other attribute. The one consequence
-		// worth knowing: a ReplaceAttr that renames keys can defeat the check
-		// below, since it runs after it.
 		if _, taken := root[k]; taken {
 			continue
 		}
@@ -176,6 +187,13 @@ func (b *treeBuilder) appendAttr(dst map[string]any, groups []string, a slog.Att
 		return
 	}
 
+	// Plain assignment, so a repeated key overwrites and the last write wins.
+	// That is the whole of this package's duplicate-key policy, and it is
+	// deliberate rather than a side effect of the tree being a map: see
+	// DESIGN §4. Do not make this yield to the existing value — slog's own
+	// semantics are that a call-site attribute overrides one from the With
+	// chain that produced the logger, and reversing that here would make this
+	// the only handler where it does not.
 	dst[a.Key] = b.value(a.Value)
 }
 
