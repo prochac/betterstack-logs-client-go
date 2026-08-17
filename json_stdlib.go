@@ -33,7 +33,7 @@ const jsonImplementation = "encoding/json"
 // that the bytes past its length are untouched.
 func appendJSONObject(dst []byte, m map[string]any) ([]byte, error) {
 	e := jsonEncoders.Get().(*pooledJSONEncoder)
-	defer jsonEncoders.Put(e)
+	defer putJSONEncoder(e)
 
 	e.buf.Reset()
 	if err := e.enc.Encode(m); err != nil {
@@ -65,4 +65,24 @@ var jsonEncoders = sync.Pool{
 		enc.SetEscapeHTML(false)
 		return &pooledJSONEncoder{buf: buf, enc: enc}
 	},
+}
+
+// maxPooledJSONBuffer is the largest scratch buffer worth keeping alive between
+// records. A bytes.Buffer only ever grows, so without a cap a single 5MB record
+// leaves 5MB resident for the life of the process — several times that under
+// concurrency, one per pooled encoder — to serve records that are ordinarily a
+// few hundred bytes. 64KB is well past any usual record and small enough that
+// holding one per P costs nothing.
+const maxPooledJSONBuffer = 64 << 10
+
+// putJSONEncoder returns e to the pool, unless the record it just encoded grew
+// its scratch buffer past what is worth retaining. Dropping it costs one
+// allocation of the pair on the next encode, which is the right trade against
+// pinning the outlier's capacity forever: the encoder cannot be kept without the
+// buffer, since it writes to that buffer and cannot be repointed.
+func putJSONEncoder(e *pooledJSONEncoder) {
+	if e.buf.Cap() > maxPooledJSONBuffer {
+		return
+	}
+	jsonEncoders.Put(e)
 }
