@@ -683,8 +683,15 @@ func TestRetryAfterBeyondCeilingGivesUpAtOnce(t *testing.T) {
 	if got := c.Stats().DroppedRejected; got != 3 {
 		t.Errorf("Stats().DroppedRejected = %d, want 3", got)
 	}
-	if got := errs.len(); got == 0 {
-		t.Error("OnError never fired for a batch given up on")
+	reported := errs.all()
+	if len(reported) == 0 {
+		t.Fatal("OnError never fired for a batch given up on")
+	}
+	// The give-up message reports the requests actually made, not the number
+	// the configuration would have permitted: the loop broke on the ceiling
+	// after one.
+	if got := reported[0].Error(); !strings.Contains(got, "after 1 attempt(s)") {
+		t.Errorf("OnError got %q, want it to report 1 attempt", got)
 	}
 }
 

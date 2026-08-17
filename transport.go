@@ -99,6 +99,9 @@ func (w *worker) uploadBy(ctx context.Context, b *batch, deadline time.Time) err
 	var (
 		lastErr    error
 		retryAfter time.Duration
+		// Requests actually made, which is not maxRetries+1 whenever the loop
+		// breaks early on the deadline check below.
+		attempts int
 	)
 
 	for attempt := 0; attempt <= c.cfg.maxRetries; attempt++ {
@@ -126,6 +129,7 @@ func (w *worker) uploadBy(ctx context.Context, b *batch, deadline time.Time) err
 		retryAfter = 0
 
 		status, hdrRetryAfter, body, err := c.do(ctx, b)
+		attempts++
 
 		switch {
 		case err != nil:
@@ -182,7 +186,7 @@ func (w *worker) uploadBy(ctx context.Context, b *batch, deadline time.Time) err
 
 	c.stats.droppedRejected.Add(uint64(b.records))
 	err := fmt.Errorf("betterstack: giving up on %d record(s) after %d attempt(s): %w",
-		b.records, c.cfg.maxRetries+1, lastErr)
+		b.records, attempts, lastErr)
 	c.report(err)
 	return err
 }
