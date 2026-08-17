@@ -646,6 +646,11 @@ func TestNewClientValidation(t *testing.T) {
 		{"burst maximum without a window", testToken, []ClientOption{WithBurstProtection(10, 0)}, "WithBurstProtection"},
 		{"burst window without a maximum", testToken, []ClientOption{WithBurstProtection(0, time.Second)}, "WithBurstProtection"},
 		{"negative burst maximum", testToken, []ClientOption{WithBurstProtection(-1, -time.Second)}, "WithBurstProtection"},
+		// Compression is an exported int enum, so a value outside it is
+		// representable. Unchecked it would read as "not gzip" and silently
+		// disable compression.
+		{"unknown compression", testToken, []ClientOption{WithCompression(Compression(7))}, "WithCompression"},
+		{"negative compression", testToken, []ClientOption{WithCompression(Compression(-1))}, "WithCompression"},
 	}
 
 	for _, tt := range tests {

@@ -523,6 +523,13 @@ func (cfg *clientConfig) validate() error {
 	if cfg.retryBackoff < 0 {
 		return fmt.Errorf("betterstack: WithRetryBackoff(%v) must not be negative", cfg.retryBackoff)
 	}
+	// Compression is an exported int enum, so an unknown value is
+	// representable. Both places that read it test for CompressionGzip, so an
+	// unchecked typo would silently disable compression rather than fail — the
+	// one option whose misuse would otherwise be invisible.
+	if cfg.compression != CompressionGzip && cfg.compression != CompressionNone {
+		return fmt.Errorf("betterstack: WithCompression(%d) is not a known compression", cfg.compression)
+	}
 	// Burst protection is the one option that is legitimately zero — that is
 	// how it stays off — so it cannot join either table above. Half of it is
 	// never meaningful: a maximum without a window has no rate in it, and a

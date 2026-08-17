@@ -129,27 +129,30 @@ func (w *worker) uploadBy(ctx context.Context, b *batch, deadline time.Time) err
 			}
 			lastErr = err
 
-		case status/100 == 2:
+		case status/100 == 2: // 2xx
 			c.stats.sent.Add(uint64(b.records))
 			return nil
 
 		default:
-			retryable := isRetryable(status)
-			se := &StatusError{
-				StatusCode: status,
-				Body:       body,
-				Records:    b.records,
-				Retryable:  retryable,
-			}
-
 			// 413 is not retryable — the same bytes would fail again — but it
 			// is recoverable, which is a different thing. Half the batch may
 			// well fit. This is the only case the local size check cannot
 			// pre-empt: MaxBatchBytes is measured before compression and the
 			// server's limit applies after it, so how much fits is not
 			// knowable until the server says.
+			//
+			// Checked before the StatusError is built: this path never reports
+			// one, since nothing was given up on.
 			if status == http.StatusRequestEntityTooLarge && b.records > 1 {
 				return w.splitAndSend(ctx, b, deadline)
+			}
+
+			retryable := isRetryable(status)
+			se := &StatusError{
+				StatusCode: status,
+				Body:       body,
+				Records:    b.records,
+				Retryable:  retryable,
 			}
 
 			if !retryable {
@@ -237,7 +240,7 @@ func (c *Client) do(ctx context.Context, b *batch) (status int, retryAfter time.
 		_ = resp.Body.Close()
 	}()
 
-	if resp.StatusCode/100 != 2 {
+	if resp.StatusCode/100 != 2 { // !2xx
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, bodySnippetBytes))
 		body = string(snippet)
 	}
