@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 )
 
@@ -178,6 +179,47 @@ type msgpackEncoder struct{ marshal Marshaler }
 
 func (msgpackEncoder) ContentType() string { return "application/msgpack" }
 
+// The MessagePack type bytes this package writes or inspects. The format is
+// frozen — these values have not changed since the 2013 spec revision and
+// cannot, since every decoder in existence depends on them.
+//
+// https://github.com/msgpack/msgpack/blob/master/spec.md
+const (
+	msgpackFixArray = 0x90 // 1001nnnn, element count in the low nibble
+	msgpackArray16  = 0xdc // followed by a big-endian uint16 count
+	msgpackArray32  = 0xdd // followed by a big-endian uint32 count
+
+	msgpackFixMap = 0x80 // 1000nnnn, entry count in the low nibble
+	msgpackMap16  = 0xde
+	msgpackMap32  = 0xdf
+
+	// The high nibble of a fixarray/fixmap byte; the low one is the count.
+	msgpackFixMask = 0xf0
+)
+
+// appendMsgPackArrayHeader appends the shortest array header for n elements:
+//
+//	n <= 15         1001nnnn                       one byte
+//	n <= 65535      0xdc  nn nn                    three bytes
+//	otherwise       0xdd  nn nn nn nn              five bytes
+func appendMsgPackArrayHeader(dst []byte, n int) []byte {
+	switch {
+	case n <= 15:
+		// Also the n == 0 case: unreachable through the sender, which never
+		// frames an empty batch, but 0x90 is an empty array and so needs no
+		// precondition to explain.
+		return append(dst, msgpackFixArray|byte(n))
+	case n <= math.MaxUint16:
+		var count [2]byte
+		binary.BigEndian.PutUint16(count[:], uint16(n))
+		return append(append(dst, msgpackArray16), count[:]...)
+	default:
+		var count [4]byte
+		binary.BigEndian.PutUint32(count[:], uint32(n))
+		return append(append(dst, msgpackArray32), count[:]...)
+	}
+}
+
 // Frame prefixes the batch with a MessagePack array header for n records.
 //
 // The header is one, three or five bytes depending on n, so unlike JSONArray
@@ -190,25 +232,15 @@ func (msgpackEncoder) ContentType() string { return "application/msgpack" }
 // reused scratch buffer and keeps the result, so a re-sliced return advances the
 // buffer's start by k on every batch and the buffer grows without bound.
 func (msgpackEncoder) Frame(batch []byte, n int) []byte {
-	var hdr [5]byte
-	var w int
-	switch {
-	case n < 16:
-		// fixarray. Also the n == 0 case: unreachable through the sender, which
-		// never frames an empty batch, but 0x90 is an empty array and needs no
-		// precondition to explain.
-		hdr[0], w = 0x90|byte(n), 1
-	case n < 1<<16:
-		hdr[0], w = 0xdc, 3
-		binary.BigEndian.PutUint16(hdr[1:], uint16(n))
-	default:
-		hdr[0], w = 0xdd, 5
-		binary.BigEndian.PutUint32(hdr[1:], uint32(n))
-	}
+	var scratch [5]byte
+	hdr := appendMsgPackArrayHeader(scratch[:0], n)
 
-	batch = append(batch, hdr[:w]...) // grow by the header width
-	copy(batch[w:], batch)            // shift the records right; copy is memmove
-	copy(batch[:w], hdr[:w])
+	// Prepend hdr to batch, in place: grow by the header width, slide the
+	// records right into the room that made, then fill the gap left at the
+	// front. The middle copy overlaps, which is fine — copy is a memmove.
+	batch = append(batch, hdr...)
+	copy(batch[len(hdr):], batch)
+	copy(batch, hdr)
 	return batch
 }
 
@@ -232,8 +264,8 @@ func checkMsgPackMap(b []byte) error {
 	if len(b) == 0 {
 		return errors.New("betterstack: Marshaler returned no bytes")
 	}
-	// fixmap, map16, map32.
-	if c := b[0]; (c&0xf0) == 0x80 || c == 0xde || c == 0xdf {
+	switch c := b[0]; {
+	case c&msgpackFixMask == msgpackFixMap, c == msgpackMap16, c == msgpackMap32:
 		return nil
 	}
 	return fmt.Errorf("betterstack: Marshaler produced 0x%02x, not a MessagePack map; "+
