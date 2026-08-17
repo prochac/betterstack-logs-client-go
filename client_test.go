@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -123,6 +124,26 @@ func TestFlushWaitsForUpload(t *testing.T) {
 	}
 }
 
+// Flush documents a nil context as Background. Nothing else in the suite passes
+// one, so without this the substitution would go untested.
+func TestFlushNilContext(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, _ := newTestClient(t, rec, WithBatchSize(1000))
+	defer c.Close()
+
+	enqueueN(t, c, 1)
+	//nolint:staticcheck // SA1012: the nil context is what this test is for.
+	if err := c.Flush(nil); err != nil {
+		t.Fatalf("Flush(nil): %v", err)
+	}
+
+	if got := len(rec.records()); got != 1 {
+		t.Errorf("got %d records delivered, want 1", got)
+	}
+}
+
 // Everything enqueued before the call must be delivered by the time it returns.
 func TestFlushDeliversEverythingEnqueuedBefore(t *testing.T) {
 	t.Parallel()
@@ -186,7 +207,7 @@ func TestFlushReturnsAndClearsError(t *testing.T) {
 		t.Fatal("Flush returned nil after a 401")
 	}
 	var se *StatusError
-	if !errors.As(err, &se) || se.StatusCode != 401 {
+	if !errors.As(err, &se) || se.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("Flush error = %v, want a *StatusError with 401", err)
 	}
 
@@ -272,7 +293,7 @@ func TestCloseIsIdempotent(t *testing.T) {
 
 	first := c.Close()
 	second := c.Close()
-	if first != second {
+	if !errors.Is(first, second) {
 		t.Errorf("Close returned %v then %v; it must be stable", first, second)
 	}
 	if got := rec.count(); got != 0 {
@@ -300,7 +321,7 @@ func TestCloseConcurrent(t *testing.T) {
 	wg.Wait()
 
 	for i, err := range errs {
-		if err != errs[0] {
+		if !errors.Is(err, errs[0]) {
 			t.Errorf("Close %d returned %v, want %v: every caller gets the same error", i, err, errs[0])
 		}
 	}

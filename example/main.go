@@ -63,6 +63,7 @@ func main() {
 	// skip the client's Close and lose whatever was still batched — the single
 	// most common way to lose logs with a batching client.
 	if err := run(ctx); err != nil {
+		stop() // os.Exit runs no deferred call, and this one is idempotent
 		fmt.Fprintln(os.Stderr, "example:", err)
 		os.Exit(1)
 	}
@@ -76,8 +77,8 @@ func run(ctx context.Context) error {
 	// Close flushes what is still accumulating, waits for the uploads in
 	// flight, and returns the first delivery error it saw. It is not optional.
 	defer func() {
-		if err := client.Close(); err != nil {
-			fmt.Fprintln(os.Stderr, "example: close:", err)
+		if closeErr := client.Close(); closeErr != nil {
+			fmt.Fprintln(os.Stderr, "example: close:", closeErr)
 		}
 		printStats(client.Stats())
 	}()
@@ -311,7 +312,7 @@ func routes() http.Handler {
 // produces output without a second terminal.
 func drive(ctx context.Context, base string) {
 	for _, path := range []string{"/", "/", "/health", "/fail"} {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, http.NoBody)
 		if err != nil {
 			continue
 		}

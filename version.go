@@ -13,6 +13,11 @@ const modulePath = "github.com/prochac/logs-client-go"
 // convention (PARITY §3).
 const clientName = "logs-client-go"
 
+// devVersion is the version reported when build info names no real one: the
+// module is the main module, was replaced by a directory, or was built without
+// VCS information.
+const devVersion = "dev"
+
 // userAgent returns the User-Agent sent with every request, e.g.
 // "logs-client-go/v0.1.0".
 //
@@ -39,7 +44,7 @@ var userAgent = sync.OnceValue(func() string {
 func moduleVersion() string {
 	bi, ok := debug.ReadBuildInfo()
 	if !ok {
-		return "dev"
+		return devVersion
 	}
 	for _, dep := range bi.Deps {
 		if dep == nil || dep.Path != modulePath {
@@ -52,12 +57,12 @@ func moduleVersion() string {
 		if isRealVersion(dep.Version) {
 			return dep.Version
 		}
-		return "dev"
+		return devVersion
 	}
 	if bi.Main.Path == modulePath && isRealVersion(bi.Main.Version) {
 		return bi.Main.Version
 	}
-	return "dev"
+	return devVersion
 }
 
 func isRealVersion(v string) bool {

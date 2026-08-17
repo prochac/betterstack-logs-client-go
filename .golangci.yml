@@ -1,0 +1,206 @@
+# golangci-lint configuration.
+#
+# There is no CI (CLAUDE.md, "Repository conventions"), so this file is the
+# checklist a human runs by hand:
+#
+#     golangci-lint run ./...
+#     golangci-lint fmt ./...
+#
+# Two blind spots are worth knowing about.
+#
+# json_v2.go is behind `go1.27 && goexperiment.jsonv2`, so this run does not
+# compile it — it lints json_stdlib.go and reports success for a package that
+# ships both. Pointing golangci-lint at the newer toolchain does not work
+# either: v2.12 is built with go1.26 and its go/types panics on a 1.27 stdlib.
+# Until that lands, `GOEXPERIMENT=jsonv2 go1.27rc3 vet ./...` is the check that
+# path gets, which is the same floor CLAUDE.md already sets for it.
+#
+# msgpackcompat/ is a separate module, so `./...` does not reach it. Run
+# golangci-lint from inside it; it finds this file by walking up.
+version: "2"
+
+# Report everything. The defaults cap a linter at 50 issues and the same issue
+# at 3, which quietly hides the tail of a first run — the very thing you want to
+# see when adopting a config.
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    - asasalint # []any accidentally passed to a variadic ...any
+    - asciicheck # non-ASCII identifiers
+    - bidichk # bidirectional unicode that renders differently than it parses
+    - bodyclose # unclosed http.Response.Body — this package makes requests
+    - dupword # "the the" in comments; this repo is comment-heavy
+    - durationcheck # nonsensical time.Duration arithmetic
+    - errname # error types named FooError, sentinels named ErrFoo
+    - errorlint # %v on an error where %w was meant; == on wrapped errors
+    - gocheckcompilerdirectives # a mistyped //go: directive is a plain comment
+    - gochecknoinits # no hidden package-level side effects in a library
+    - gocognit # cognitive complexity — see settings below
+    - goconst # repeated string literals that want a named constant
+    - gocritic # broad style/perf/diagnostic set
+    - gosec # security-adjacent patterns
+    - makezero # make([]T, n) then append — a classic length/capacity slip
+    - misspell
+    - nakedret # naked returns in long functions
+    - nilerr # `if err != nil { return nil }`
+    - nolintlint # every //nolint must be specific and explained
+    - perfsprint # fmt.Sprintf where a cheaper conversion exists
+    - prealloc # slice growth in a loop with a known bound
+    - predeclared # shadowing len, cap, new, ...
+    - reassign # writing to another package's exported variable
+    - revive # golint's successor; the style rules
+    - thelper # test helpers must call t.Helper()
+    - tparallel # t.Parallel() misuse — this suite is parallel throughout
+    - unconvert # redundant type conversions
+    - unparam # always-nil errors, unused parameters
+    - usestdlibvars # http.StatusTeapot over 418
+    - wastedassign
+    - whitespace # leading/trailing blank lines inside a block
+
+  settings:
+    dupword:
+      ignore:
+        - nn # the MessagePack header diagram in encoder.go
+        - x # test payloads are lines of "x"; a repeated one is not a typo
+
+    gocognit:
+      # Nothing in the library exceeds this today. The sender's select loop and
+      # the retry loop are the two that come closest; both are state machines
+      # whose branches are the specification, so raising this is preferable to
+      # splitting them into functions that are only ever called once.
+      min-complexity: 30
+
+    goconst:
+      min-len: 3
+      min-occurrences: 4
+      # Otherwise a literal that appears once in the library and three times in
+      # its tests is reported against the library, which is backwards: the
+      # tests are meant to state the expected value literally rather than to
+      # assert a constant against itself.
+      ignore-tests: true
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      # gocritic earns its place on the checks that point at something you can
+      # act on — paramTypeCombine, typeDefFirst, httpNoBody, stringXbytes,
+      # unnamedResult all produced real edits here. The ones below cannot: each
+      # fires on a construct this code is obliged to use, so the only available
+      # response is to suppress it. A check whose every hit ends in a nolint is
+      # better turned off once, here, than argued with at each site.
+      disabled-checks:
+        # This repo explains itself in prose; multi-paragraph comments and
+        # commented-out wire samples are intentional.
+        - commentFormatting
+        - whyNoLint
+        # if/else chains that mirror a spec table read better than a switch.
+        - ifElseChain
+        # appendAssign is deliberately NOT disabled. It fired once, on the
+        # group-path append in attr.go, and it was pointing at something real:
+        # a plain append there lets two sibling groups share a backing array,
+        # which a retained slice observes as its path being rewritten under it.
+        # That site now uses a three-index slice and the check stays on.
+        #
+        # hugeParam wants slog.Record (288 bytes) passed by pointer. The
+        # slog.Handler interface fixes that signature, and Record is a value
+        # type by deliberate design upstream. Nothing to do about it.
+        - hugeParam
+        # exitAfterDefer flags example/main.go's os.Exit, which is the whole
+        # point of that function: run() returns errors so that its defers run,
+        # and main does the exiting. The one defer in main is called by hand
+        # first. The example is teaching precisely this, so the construct
+        # stays.
+        - exitAfterDefer
+
+    gosec:
+      excludes:
+        # G115, integer overflow on conversion. Every hit is the same pair of
+        # conversions between a batch's int record count and the uint64 atomic
+        # counters it feeds: both sides are non-negative and bounded by the
+        # queue, and there is no arithmetic in between. Silencing the rule
+        # beats fourteen inline nolints for one shape.
+        - G115
+
+    govet:
+      enable-all: true
+      disable:
+        # fieldalignment reorders struct fields for padding. The structs here
+        # are grouped by meaning and documented in that order; the two that are
+        # hot (batch, counters) are already laid out deliberately.
+        - fieldalignment
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: empty-block
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: exported
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: var-declaration
+        - name: var-naming
+
+    staticcheck:
+      checks:
+        - all
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Tests may hold literals, defer Close without checking, and be long.
+      - path: _test\.go$
+        linters:
+          - errcheck
+          - goconst
+          - gocognit
+          - gosec
+          - unparam
+      # The example is documentation: it prints to stdout and ignores the
+      # errors that a real service would handle, so that the code stays about
+      # the client rather than about error plumbing.
+      - path: ^example/
+        linters:
+          - errcheck
+          - gosec
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    gofumpt:
+      extra-rules: true
+    goimports:
+      local-prefixes:
+        - github.com/prochac/logs-client-go

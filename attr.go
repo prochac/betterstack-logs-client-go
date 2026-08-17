@@ -68,7 +68,7 @@ type treeBuilder struct {
 // an attribute keyed "source" appears second and, under the last-wins rule that
 // every JSON consumer applies, is the one that survives. Emitting both is not
 // open to us — see DESIGN §4 — so yielding is how the same outcome is reached.
-func (b *treeBuilder) build(goas []groupOrAttrs, ctxAttrs []slog.Attr, r *slog.Record, source map[string]any, extra map[string]any) map[string]any {
+func (b *treeBuilder) build(goas []groupOrAttrs, ctxAttrs []slog.Attr, r *slog.Record, source, extra map[string]any) map[string]any {
 	root := b.walk(goas, nil, func(dst map[string]any, groups []string) {
 		r.Attrs(func(a slog.Attr) bool {
 			b.appendAttr(dst, groups, a)
@@ -116,7 +116,7 @@ func (b *treeBuilder) walk(goas []groupOrAttrs, groups []string, tail func(map[s
 		if goa.group != "" {
 			// Everything after this entry belongs inside the group, so the
 			// remainder of the list is consumed by the recursion.
-			child := b.walk(goas[i+1:], append(groups, goa.group), tail)
+			child := b.walk(goas[i+1:], childPath(groups, goa.group), tail)
 			if len(child) > 0 {
 				dst[goa.group] = child
 			}
@@ -129,6 +129,28 @@ func (b *treeBuilder) walk(goas []groupOrAttrs, groups []string, tail func(map[s
 
 	tail(dst, groups)
 	return dst
+}
+
+// childPath returns groups extended by one level, in an array of its own.
+//
+// The obvious append(groups, name) is *almost* right: the extended path is
+// dead before a sibling at the same depth reuses the slot it borrowed, so
+// nothing here observes the sharing. But "dead before" is a property of the
+// traversal that has to be re-proved by hand every time this file is touched,
+// and it is not a property callers can see — a ReplaceAttr that keeps the
+// slice it was handed finds its path rewritten by the next sibling group.
+// slog.JSONHandler leaves that edge exposed (its group stack is pooled, pushed
+// and popped); allocating exactly len+1 here closes it for one small
+// allocation, next to the map allocated by the caller anyway, and measures as
+// no change at all in BenchmarkHandleGroups.
+//
+// This is the same reasoning, and the same exact-size copy, as
+// Handler.withGroupOrAttrs.
+func childPath(groups []string, name string) []string {
+	sub := make([]string, len(groups)+1)
+	copy(sub, groups)
+	sub[len(groups)] = name
+	return sub
 }
 
 // appendAttr writes one attribute into dst.
@@ -166,7 +188,7 @@ func (b *treeBuilder) appendAttr(dst map[string]any, groups []string, a slog.Att
 			return
 		}
 		child := make(map[string]any, len(members))
-		sub := append(groups, a.Key)
+		sub := childPath(groups, a.Key)
 		for _, m := range members {
 			b.appendAttr(child, sub, m)
 		}

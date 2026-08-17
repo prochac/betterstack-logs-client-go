@@ -42,6 +42,16 @@ go test -run '^$' -bench . -benchmem -benchtime 2s ./...
 go test -race -run TestSlogtest ./...   # handler conformance alone
 ```
 
+Plus `golangci-lint`, configured by `.golangci.yml` (golangci-lint v2 schema; `golangci-lint config verify` checks it). The repository lints and formats clean, so any output is a regression:
+
+```sh
+golangci-lint run ./...
+golangci-lint fmt --diff ./...          # gofumpt -extra plus goimports; empty output
+(cd msgpackcompat && golangci-lint run ./...)   # separate module, same config
+```
+
+Read the header of `.golangci.yml` before adding a linter or an exclusion: it records why `gosec`'s G115 is off wholesale, why `goconst` ignores tests, and the two blind spots the run has. It also cannot see `json_v2.go` — golangci-lint v2.12 is built with go1.26 and its `go/types` panics on a 1.27 stdlib, so that path gets `GOEXPERIMENT=jsonv2 go1.27rc3 vet ./...` and nothing more.
+
 **The suite must be run on two toolchains, and neither alone is sufficient.** The JSON record encoder is build-tagged (`json_stdlib.go` / `json_v2.go`), so one toolchain exercises one implementation and reports success for a library that ships both. There are four reachable configurations:
 
 ```sh
@@ -113,7 +123,9 @@ The greenfield rewrite only buys clean licensing if no source is copied. `samber
 ## Repository conventions
 
 - **The exported API is not frozen**, but it is close to it. This is a new module with its own v0, so breaking changes are cheap now and expensive after the first tag. Decide API shape before tagging v0.1.
-- No CI and no Makefile — a deliberate scope choice, not an oversight.
+- No CI and no Makefile — a deliberate scope choice, not an oversight. `.golangci.yml` is therefore a checklist a human runs, not a gate something enforces.
+- **Suppress in the config, not at the site.** `nolintlint` runs with `require-explanation`, `require-specific` and `allow-unused: false`, but the stronger rule is upstream of it: if a check can only ever be answered with a suppression, turn the check off once in `.golangci.yml` with the reason, rather than repeating it at every hit. Two `gocritic` checks are off for exactly that (`hugeParam`, `exitAfterDefer`), as is `gosec`'s G115. That leaves two `//nolint`s in the whole tree — the retry jitter's `math/rand`, and the `Flush(nil)` one test exists to check — and both mark something genuinely local.
+- **`gocritic`'s `appendAssign` is enabled, and `attr.go` must keep it satisfied.** It fired on the group-path `append(groups, key)` and was right to: two sibling groups nested in a third borrow the same spare slot in the parent's array, so a `ReplaceAttr` that keeps the slice it was handed sees its path rewritten. `slog.JSONHandler` has the same edge — its group stack is pooled, pushed and popped — and fails the test below, so this is a guarantee *stronger* than the standard library's, not a bug fix. Both sites go through `childPath`, an exact-size copy like `withGroupOrAttrs`, which benchmarks as no change at all. `TestReplaceAttr/the_group_path_is_not_shared_between_siblings` holds it; it has been verified to fail against a plain `append`, and note that the *shape* matters — one nested group does not reproduce it, because nothing overwrites the slot afterwards.
 - **`example/` is `package main` inside this module**, so `go build ./...` and `go vet ./...` cover it and it cannot rot. It therefore lives under the same Go 1.21 floor as the library: no `for range int`, no method patterns in `http.ServeMux` (`"GET /x"` is 1.22), nothing else `stdversion` would catch.
 - The example must stay runnable with no credentials. `go run ./example` falls back to dry run; `-endpoint` points it at a local sink, which is how its wire output was verified.
 - No git remote is configured.

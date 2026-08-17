@@ -222,7 +222,9 @@ func TestReplaceAttr(t *testing.T) {
 		var seen [][]string
 		var keys []string
 		opts := []HandlerOption{WithReplaceAttr(func(groups []string, a slog.Attr) slog.Attr {
-			// The contract says the slice must not be retained, so copy it.
+			// Copied because that is what the log/slog contract asks of a
+			// ReplaceAttr, not because this handler needs it — see the
+			// sibling subtest below.
 			seen = append(seen, append([]string(nil), groups...))
 			keys = append(keys, a.Key)
 			return a
@@ -242,6 +244,43 @@ func TestReplaceAttr(t *testing.T) {
 		for _, k := range keys {
 			if k == "g" {
 				t.Error("ReplaceAttr was called for the group attr itself")
+			}
+		}
+	})
+
+	// The group path handed to ReplaceAttr keeps its contents after the call
+	// returns, which is more than log/slog promises and more than
+	// slog.JSONHandler delivers: its group stack is a pooled slice that is
+	// pushed and popped, so a retained one is rewritten by the next sibling
+	// group — verified against slog.JSONHandler, which fails this exact test.
+	//
+	// The guarantee comes from the three-index slices in attr.go. This test is
+	// what stops them being simplified back to a plain append: the shape below
+	// is the one that exposes the sharing, two sibling groups nested inside a
+	// third so that both borrow the same spare slot in the parent's array. A
+	// single nested group does not reproduce it, because nothing overwrites it
+	// afterwards.
+	t.Run("the group path is not shared between siblings", func(t *testing.T) {
+		t.Parallel()
+		var retained, atCallTime [][]string
+		opts := []HandlerOption{WithReplaceAttr(func(groups []string, a slog.Attr) slog.Attr {
+			retained = append(retained, groups) // deliberately not copied
+			atCallTime = append(atCallTime, append([]string(nil), groups...))
+			return a
+		})}
+
+		logRecord(t, opts, func(l *slog.Logger) {
+			l.WithGroup("w1").WithGroup("w2").Info("msg", slog.Group("g",
+				slog.Group("n1", slog.Int("k", 1)),
+				slog.Group("n2", slog.Int("k", 2)),
+				slog.Group("n3", slog.Int("k", 3)),
+			))
+		})
+
+		for i := range retained {
+			if !reflect.DeepEqual(retained[i], atCallTime[i]) {
+				t.Errorf("call %d: groups was %v during the call and reads %v now: a sibling group overwrote it",
+					i, atCallTime[i], retained[i])
 			}
 		}
 	})

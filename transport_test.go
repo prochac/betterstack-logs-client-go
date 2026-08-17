@@ -459,7 +459,7 @@ func TestPayloadTooLargeSplitsDownToNothing(t *testing.T) {
 	err := c.Flush(context.Background())
 
 	var se *StatusError
-	if !errors.As(err, &se) || se.StatusCode != 413 {
+	if !errors.As(err, &se) || se.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("Flush error = %v, want a *StatusError with 413", err)
 	}
 	if got := c.Stats().Sent; got != 0 {
@@ -493,7 +493,7 @@ func TestPayloadTooLargeSingleRecordIsDropped(t *testing.T) {
 	err := c.Flush(context.Background())
 
 	var se *StatusError
-	if !errors.As(err, &se) || se.StatusCode != 413 {
+	if !errors.As(err, &se) || se.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("Flush error = %v, want a *StatusError with 413", err)
 	}
 	if got := c.Stats().DroppedOversize; got != 1 {
@@ -760,7 +760,7 @@ func TestTransportTuning(t *testing.T) {
 	t.Parallel()
 
 	cfg := clientConfig{maxInFlight: 7, connectTimeout: 5 * time.Second}
-	tr := newTransport(cfg)
+	tr := newTransport(&cfg)
 
 	// Go only auto-configures HTTP/2 on a Transport it recognises as
 	// unmodified, and setting DialContext — which WithConnectTimeout requires —

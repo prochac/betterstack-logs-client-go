@@ -31,7 +31,7 @@ const (
 //
 // Four details here silently defeat connection reuse if missed, and each costs
 // a full TCP and TLS handshake per batch when it is.
-func newTransport(cfg clientConfig) *http.Transport {
+func newTransport(cfg *clientConfig) *http.Transport {
 	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{

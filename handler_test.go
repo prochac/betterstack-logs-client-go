@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -468,7 +469,7 @@ func TestFilteredRecordsAreNotCounted(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		logger.Info("dropped by the filter")
 	}
-	if err := c.Flush(nil); err != nil {
+	if err := c.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
@@ -714,7 +715,7 @@ func TestHandlePropagatesSinkError(t *testing.T) {
 
 	sink := &stubSink{err: ErrClosed}
 	err := newHandler(sink).Handle(context.Background(), slog.NewRecord(time.Now(), slog.LevelInfo, "msg", 0))
-	if err != ErrClosed {
+	if !errors.Is(err, ErrClosed) {
 		t.Errorf("Handle returned %v, want ErrClosed", err)
 	}
 }

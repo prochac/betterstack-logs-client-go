@@ -11,11 +11,11 @@ import (
 // testLimiter builds a limiter driven by an explicit clock instead of the wall
 // one. A rate limiter tested against real time is either slow or flaky, and the
 // suite refuses both; the returned function advances the clock.
-func testLimiter(t *testing.T, maxRecords int, window time.Duration) (*limiter, func(time.Duration)) {
+func testLimiter(t *testing.T, maxRecords int, window time.Duration) (l *limiter, advance func(time.Duration)) {
 	t.Helper()
 
 	var now atomic.Int64 // atomic: the concurrency test reads it from many goroutines
-	l := newLimiter(maxRecords, window)
+	l = newLimiter(maxRecords, window)
 	l.now = now.Load
 
 	return l, func(d time.Duration) { now.Add(int64(d)) }

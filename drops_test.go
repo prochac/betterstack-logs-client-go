@@ -201,7 +201,7 @@ func TestWithEncoder(t *testing.T) {
 	defer c.Close()
 
 	enqueueN(t, c, 2)
-	if err := c.Flush(nil); err != nil { // a nil context is treated as Background
+	if err := c.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
@@ -241,7 +241,7 @@ func TestEncoderFramesEachBatch(t *testing.T) {
 	defer c.Close()
 
 	enqueueN(t, c, 3)
-	if err := c.Flush(nil); err != nil {
+	if err := c.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
@@ -289,7 +289,7 @@ func TestWithJSONArrayEncoder(t *testing.T) {
 	defer c.Close()
 
 	enqueueN(t, c, 3)
-	if err := c.Flush(nil); err != nil {
+	if err := c.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
@@ -317,7 +317,7 @@ func TestWithMsgPackEncoder(t *testing.T) {
 	defer c.Close()
 
 	enqueueN(t, c, 3)
-	if err := c.Flush(nil); err != nil {
+	if err := c.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
@@ -353,7 +353,7 @@ func TestMsgPackEncodesTimeAsATimestamp(t *testing.T) {
 	if err := c.Enqueue(map[string]any{KeyTime: when, KeyMessage: "x"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if err := c.Flush(nil); err != nil {
+	if err := c.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
@@ -392,7 +392,7 @@ func TestOversizeBatchIsSplitBeforeSending(t *testing.T) {
 			t.Fatalf("Enqueue(%d): %v", i, err)
 		}
 	}
-	if err := c.Flush(nil); err != nil {
+	if err := c.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
@@ -434,7 +434,7 @@ func TestOversizeRecordIsDroppedBeforeSending(t *testing.T) {
 	if err := c.Enqueue(map[string]any{KeyMessage: huge, KeyLevel: "INFO"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if err := c.Flush(nil); err != nil {
+	if err := c.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
@@ -469,7 +469,7 @@ func TestDryRunSendsNothing(t *testing.T) {
 	defer c.Close()
 
 	enqueueN(t, c, 25)
-	if err := c.Flush(nil); err != nil {
+	if err := c.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 

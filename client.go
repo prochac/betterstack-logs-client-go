@@ -461,7 +461,7 @@ func NewClient(sourceToken string, opts ...ClientOption) (*Client, error) {
 	if cfg.httpClient != nil {
 		c.hc = cfg.httpClient
 	} else {
-		c.transport = newTransport(cfg)
+		c.transport = newTransport(&cfg)
 		c.ownsTransport = true
 		c.hc = &http.Client{Transport: c.transport}
 	}
@@ -607,7 +607,8 @@ func (c *Client) Enqueue(event map[string]any) error {
 // included.
 //
 // Flush returns ErrClosed if the client is already closed, and ctx.Err() if ctx
-// expires first — it will not hang waiting on a sender that has gone away.
+// expires first — it will not hang waiting on a sender that has gone away. A
+// nil ctx is treated as context.Background().
 func (c *Client) Flush(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -706,6 +707,24 @@ type batch struct {
 	bounds []int
 }
 
+// packer turns a run of encoded records into a request body. It owns reusable
+// scratch buffers, so exactly one goroutine may use a given packer: the sender
+// has one, and an upload worker builds its own the first time it has to split a
+// batch. That per-goroutine ownership is what keeps the reused gzip.Writer
+// sound now that compression is no longer confined to the sender.
+type packer struct {
+	scratch []byte      // framing buffer, reused across batches
+	gz      *compressor // nil when compression is off
+}
+
+func newPacker(comp Compression) *packer {
+	p := &packer{}
+	if comp == CompressionGzip {
+		p.gz = newCompressor()
+	}
+	return p
+}
+
 // split divides b in half by record count. The caller must have checked that b
 // holds at least two records; a single record that is too large cannot be made
 // smaller and is dropped instead.
@@ -733,24 +752,6 @@ func (p *packer) split(enc Encoder, b *batch) (left, right *batch, err error) {
 		return nil, nil, err
 	}
 	return left, right, nil
-}
-
-// packer turns a run of encoded records into a request body. It owns reusable
-// scratch buffers, so exactly one goroutine may use a given packer: the sender
-// has one, and an upload worker builds its own the first time it has to split a
-// batch. That per-goroutine ownership is what keeps the reused gzip.Writer
-// sound now that compression is no longer confined to the sender.
-type packer struct {
-	scratch []byte      // framing buffer, reused across batches
-	gz      *compressor // nil when compression is off
-}
-
-func newPacker(comp Compression) *packer {
-	p := &packer{}
-	if comp == CompressionGzip {
-		p.gz = newCompressor()
-	}
-	return p
 }
 
 // pack frames, compresses and wraps a run of encoded records into a batch that

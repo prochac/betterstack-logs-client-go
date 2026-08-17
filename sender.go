@@ -323,7 +323,8 @@ func newUploadPool(c *Client) *uploadPool {
 			// is Go 1.22, out of reach), and, once a 413 forces a split, a
 			// private packer.
 			w := &worker{
-				c:   c,
+				c: c,
+				//nolint:gosec // G404: this seeds retry jitter, not a secret.
 				rnd: rand.New(rand.NewSource(time.Now().UnixNano() ^ seed)),
 			}
 			for b := range p.jobs {
