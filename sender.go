@@ -29,6 +29,13 @@ type sender struct {
 	// guesswork.
 	armed bool
 
+	// reportTicker paces drop summaries independently of batching. Every state
+	// this goroutine can be in is a state in which records may be dropping:
+	// idle, so no flush is coming; or parked in handOff, so no flush can
+	// complete. Both are answered by a tick, which is received in the run loop
+	// and in the hand-off wait alike.
+	reportTicker *time.Ticker
+
 	pk *packer
 
 	lastDropReport time.Time
@@ -44,6 +51,7 @@ func newSender(c *Client) *sender {
 		c:              c,
 		buf:            make([]byte, 0, 64<<10),
 		timer:          newStoppedTimer(),
+		reportTicker:   time.NewTicker(c.cfg.dropReportInterval),
 		pk:             newPacker(c.cfg.compression),
 		lastDropReport: time.Now(),
 	}
@@ -92,6 +100,7 @@ func (s *sender) run() {
 	defer close(s.c.senderDone)
 	defer s.c.pool.shutdown()
 	defer s.timer.Stop()
+	defer s.reportTicker.Stop()
 
 	for {
 		select {
@@ -111,6 +120,12 @@ func (s *sender) run() {
 			}
 			// A fire on an empty batch is a no-op. It happens when a flush
 			// raced the timer, and is cheaper to tolerate than to prevent.
+
+		case <-s.reportTicker.C:
+			// Drops that happen just before the traffic stops would otherwise
+			// wait for a flush that is not coming, and on a client that has
+			// gone quiet that means until Close.
+			s.maybeReportDrops()
 
 		case req := <-s.c.flushC:
 			s.drain(req.ctx)
@@ -203,7 +218,7 @@ func (s *sender) flush(ctx context.Context) {
 // limit after it.
 func (s *sender) dispatch(ctx context.Context, b *batch) {
 	if len(b.body) <= hardMaxRequestBytes {
-		s.c.pool.dispatch(ctx, b)
+		s.handOff(ctx, b)
 		return
 	}
 
@@ -224,6 +239,45 @@ func (s *sender) dispatch(ctx context.Context, b *batch) {
 	s.dispatch(ctx, right)
 }
 
+// handOff gives a completed batch to the upload pool, waiting for a slot.
+//
+// It blocks, and that is deliberate. The tempting alternative — drop the batch
+// when every worker is busy, so that assembly never stalls — throws records
+// away during an ordinary burst: fill the queue faster than MaxInFlight uploads
+// can drain it, which any application does when it logs a thousand lines at
+// once, and whole assembled batches evaporate while the server is perfectly
+// healthy.
+//
+// Blocking here instead propagates backpressure to the queue, which is the one
+// place records are meant to be shed: it is explicitly sized by the caller
+// through WithMaxQueueSize, it drops with an accurate count, and Enqueue still
+// never blocks the application. Assembling batches that have nowhere to go would
+// only move unbounded memory from the queue, where it is bounded and accounted,
+// to a backlog where it is neither.
+//
+// The wait is the one place the sender can be stuck for as long as an outage
+// lasts, and it is also where the queue behind it sheds hardest, so the drop
+// ticker is served here too. Reporting only from flush would keep the summaries
+// for after the incident, which is the wrong half of it.
+func (s *sender) handOff(ctx context.Context, b *batch) {
+	p := s.c.pool
+	for {
+		select {
+		case p.jobs <- b:
+			// Only the sender goroutine sends here, which is what makes
+			// counting the dispatch after the send safe: no waiter can
+			// register in between.
+			p.recordDispatch()
+			return
+		case <-s.reportTicker.C:
+			s.maybeReportDrops()
+		case <-ctx.Done():
+			p.abandon(b)
+			return
+		}
+	}
+}
+
 func (s *sender) reset() {
 	s.buf = s.buf[:0]
 	s.bounds = s.bounds[:0]
@@ -232,14 +286,20 @@ func (s *sender) reset() {
 
 // maybeReportDrops emits an aggregated summary at most once per interval.
 //
-// It is called at flush points rather than per record, both to keep time.Now
-// out of the hot path and because a summary is only interesting once a batch
-// boundary has passed.
+// It is called from the sender's three waiting points — after a flush, on a
+// tick of the run loop, and on a tick inside the hand-off — never per record,
+// so time.Now stays off the hot path and no drop ever pays for the reporting of
+// another. The interval check is what makes those three callers safe to combine.
 func (s *sender) maybeReportDrops() {
-	if time.Since(s.lastDropReport) < dropReportInterval {
+	if time.Since(s.lastDropReport) < s.c.cfg.dropReportInterval {
 		return
 	}
 	s.lastDropReport = time.Now()
+	// Re-phase the ticker onto the report just made. Without this a tick landing
+	// just inside the window is discarded by the check above and the summary it
+	// would have carried waits for the next one, so a flush-driven report
+	// silently stretches the periodic path to nearly twice the interval.
+	s.reportTicker.Reset(s.c.cfg.dropReportInterval)
 	s.reportDrops()
 }
 
@@ -335,41 +395,21 @@ func newUploadPool(c *Client) *uploadPool {
 	return p
 }
 
-// dispatch hands a completed batch to the workers, waiting for a slot.
+// abandon accounts for a batch that never reached a worker, because the
+// hand-off's context expired first. See sender.handOff for why that wait exists
+// at all.
 //
-// It blocks, and that is deliberate. The tempting alternative — drop the batch
-// when every worker is busy, so that assembly never stalls — throws records
-// away during an ordinary burst: fill the queue faster than MaxInFlight
-// uploads can drain it, which any application does when it logs a thousand
-// lines at once, and whole assembled batches evaporate while the server is
-// perfectly healthy.
-//
-// Blocking here instead propagates backpressure to the queue, which is the one
-// place records are meant to be shed: it is explicitly sized by the caller
-// through WithMaxQueueSize, it drops with an accurate count, and Enqueue still
-// never blocks the application. Assembling batches that have nowhere to go
-// would only move unbounded memory from the queue, where it is bounded and
-// accounted, to a backlog where it is neither.
-//
-// Called only from the sender goroutine, which is what makes incrementing
-// dispatched after the send safe: no waiter can register in between.
-func (p *uploadPool) dispatch(ctx context.Context, b *batch) {
-	select {
-	case p.jobs <- b:
-		p.recordDispatch()
-	case <-ctx.Done():
-		// Only reachable at shutdown, or when a caller's Flush context
-		// expires. The batch is lost either way, but the two are not the same
-		// drop: at shutdown the full backlog is incidental — the deadline
-		// expired with data still in flight — and an operator reading the
-		// counters afterwards should not be pointed at a backlog that was
-		// never the problem. Only a live client's Flush timing out here is a
-		// genuine DroppedBacklog.
-		if p.c.closing() {
-			p.c.stats.droppedClosed.Add(uint64(b.records))
-		} else {
-			p.c.stats.droppedBacklog.Add(uint64(b.records))
-		}
+// Only reachable at shutdown, or when a caller's Flush context expires. The
+// batch is lost either way, but the two are not the same drop: at shutdown the
+// full backlog is incidental — the deadline expired with data still in flight —
+// and an operator reading the counters afterwards should not be pointed at a
+// backlog that was never the problem. Only a live client's Flush timing out
+// there is a genuine DroppedBacklog.
+func (p *uploadPool) abandon(b *batch) {
+	if p.c.closing() {
+		p.c.stats.droppedClosed.Add(uint64(b.records))
+	} else {
+		p.c.stats.droppedBacklog.Add(uint64(b.records))
 	}
 }
 

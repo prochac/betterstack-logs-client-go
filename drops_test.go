@@ -11,6 +11,13 @@ import (
 	msgpack "github.com/shamaton/msgpack/v2"
 )
 
+// withDropReportInterval shortens the drop-summary period. Unexported and
+// test-only: the interval has no user-facing knob, and the tests that exercise
+// the periodic path would otherwise have to wait out five real seconds.
+func withDropReportInterval(d time.Duration) ClientOption {
+	return func(c *clientConfig) { c.dropReportInterval = d }
+}
+
 // reportDrops emits deltas, so a steady state produces no repeat reports and a
 // new drop produces exactly one. Driven directly because the periodic path is
 // gated on a five-second interval that no test should wait for.
@@ -23,6 +30,7 @@ func TestReportDropsEmitsDeltas(t *testing.T) {
 
 	s := newSender(c)
 	defer s.timer.Stop()
+	defer s.reportTicker.Stop()
 
 	// Nothing dropped yet.
 	s.reportDrops()
@@ -72,6 +80,7 @@ func TestReportDropsSkipsRejections(t *testing.T) {
 
 	s := newSender(c)
 	defer s.timer.Stop()
+	defer s.reportTicker.Stop()
 
 	c.stats.droppedRejected.Add(5)
 	s.reportDrops()
@@ -90,19 +99,90 @@ func TestMaybeReportDropsIsRateLimited(t *testing.T) {
 
 	s := newSender(c)
 	defer s.timer.Stop()
+	defer s.reportTicker.Stop()
 
 	c.stats.droppedQueueFull.Add(1)
 	s.maybeReportDrops()
 	if got := errs.len(); got != 0 {
-		t.Errorf("a summary was emitted within the rate-limit window (%v)", dropReportInterval)
+		t.Errorf("a summary was emitted within the rate-limit window (%v)", defaultDropReportInterval)
 	}
 
 	// Pretend the interval has elapsed.
-	s.lastDropReport = time.Now().Add(-2 * dropReportInterval)
+	s.lastDropReport = time.Now().Add(-2 * defaultDropReportInterval)
 	s.maybeReportDrops()
 	if got := errs.len(); got != 1 {
 		t.Errorf("OnError fired %d times after the interval elapsed, want 1", got)
 	}
+}
+
+// hasDrop reports whether a summary for the given reason has been delivered.
+func hasDrop(errs *errorSink, reason DropReason) bool {
+	for _, err := range errs.all() {
+		var de *DropError
+		if errors.As(err, &de) && de.Reason == reason {
+			return true
+		}
+	}
+	return false
+}
+
+// Drop summaries are paced by the sender's own ticker, not by batches
+// completing. During an outage the sender is parked in the hand-off waiting for
+// an upload slot that nothing is freeing, so a summary emitted only at a flush
+// point would arrive when the incident ends — while the queue sheds records for
+// the whole of it, which is the one thing an operator cannot see any other way.
+func TestDropSummariesArriveWhileTheSenderIsWedged(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t, withGate())
+	defer rec.release() // before the server's cleanup, and after Close below
+	c, errs := newTestClient(t, rec,
+		WithBatchSize(1),
+		WithMaxInFlight(1),
+		WithMaxQueueSize(4),
+		WithShutdownTimeout(100*time.Millisecond), // nothing here will ever be delivered
+		withDropReportInterval(20*time.Millisecond),
+	)
+	defer c.Close()
+
+	// Saturate the pool: the first batch reaches the worker the gate holds, the
+	// second the single hand-off slot behind it.
+	enqueueN(t, c, 3)
+	waitFor(t, "the upload pool to saturate", func() bool {
+		c.pool.mu.Lock()
+		defer c.pool.mu.Unlock()
+		return c.pool.dispatched == 2
+	})
+
+	// From here the sender is wedged in the hand-off with a batch it cannot
+	// place, so nothing drains the queue and these overflow it. No Flush and no
+	// Close: the summary has to arrive on its own.
+	for i := 0; i < 100; i++ {
+		_ = c.Enqueue(event(i))
+	}
+	waitFor(t, "a drop summary while the pipeline is wedged", func() bool {
+		return hasDrop(errs, DropQueueFull)
+	})
+}
+
+// The other half of the same gap: drops that happen just before the traffic
+// stops. Nothing is wedged here — there is simply no next flush, and on a client
+// that has gone quiet that used to mean nothing was reported until Close.
+func TestDropSummariesArriveWhileTheSenderIsIdle(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, errs := newTestClient(t, rec,
+		WithBatchSize(1000),               // no flush trigger can fire
+		WithBurstProtection(1, time.Hour), // one record admitted, the rest refused
+		withDropReportInterval(20*time.Millisecond),
+	)
+	defer c.Close()
+
+	enqueueN(t, c, 5)
+	waitFor(t, "a drop summary from an idle sender", func() bool {
+		return hasDrop(errs, DropBurst)
+	})
 }
 
 // Close reports whatever was lost, unconditionally: by then the sender has

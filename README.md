@@ -76,8 +76,10 @@ here blocks the caller on the network.
   counted** — never blocked. Size it with `WithMaxQueueSize`.
 - Delivery failures surface through `WithOnError`, not through `Handle`: by the
   time they happen `Handle` has long since returned, and reporting a logging
-  failure through the logger would recurse. Drops arrive as periodic aggregated
-  summaries rather than one callback per lost record.
+  failure through the logger would recurse. Drops arrive as aggregated summaries
+  rather than one callback per lost record — at most one per reason every five
+  seconds, paced by the client itself, so an outage reports what it is costing
+  while it is still going on.
 - `WithBurstProtection` is the other half of that, and is **off by default**: it
   caps how fast records are admitted at all, before they are encoded, so a
   runaway loop inside a hot path costs an atomic load per record instead of a

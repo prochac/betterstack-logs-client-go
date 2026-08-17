@@ -61,10 +61,14 @@ const (
 	// this is the backstop that stops a doomed request being sent at all.
 	hardMaxRequestBytes = 10 << 20
 
-	// dropReportInterval rate-limits drop summaries. Drops are aggregated
-	// rather than reported per record because during an outage the per-record
-	// shape is an error storm that is itself a denial of service.
-	dropReportInterval = 5 * time.Second
+	// defaultDropReportInterval rate-limits drop summaries. Drops are
+	// aggregated rather than reported per record because during an outage the
+	// per-record shape is an error storm that is itself a denial of service.
+	//
+	// It is also the period of the sender's report ticker, so it is both "at
+	// most one summary per reason per interval" and "at least one look per
+	// interval", whether or not any batch is moving.
+	defaultDropReportInterval = 5 * time.Second
 )
 
 // Compression selects the request body encoding.
@@ -172,6 +176,12 @@ type clientConfig struct {
 	onError         func(error)
 	dryRun          bool
 	httpClient      *http.Client // set only by WithHTTPClient
+
+	// dropReportInterval paces the sender's drop summaries. It has no option:
+	// it is a seam so the tests can drive the periodic path without waiting out
+	// the real interval, in the same spirit as the limiter's clock. Production
+	// only ever sees defaultDropReportInterval.
+	dropReportInterval time.Duration
 }
 
 // ClientOption configures a Client.
@@ -362,7 +372,17 @@ func WithEncoder(enc Encoder) ClientOption {
 // host process.
 //
 // Drops are delivered as aggregated *DropError summaries, not one call per
-// lost record.
+// lost record: at most one summary per reason every five seconds, carrying the
+// count since the previous one, plus a final summary from Close covering
+// everything lost over the client's life.
+//
+// The summaries are paced by the sender's own ticker rather than by batches
+// completing, so they keep arriving through the incident that produces them —
+// including while the sender is parked waiting for an upload slot that a stalled
+// server is not freeing, which is precisely when the queue is shedding fastest.
+// Their granularity is the five seconds: a burst of drops is visible within one
+// interval of starting, never sooner, and as a count rather than as the records
+// themselves, which are gone.
 func WithOnError(f func(error)) ClientOption {
 	return func(c *clientConfig) {
 		if f != nil {
@@ -474,6 +494,8 @@ func NewClient(sourceToken string, opts ...ClientOption) (*Client, error) {
 		compression:     CompressionGzip,
 		encoder:         NDJSON(),
 		onError:         defaultOnError,
+
+		dropReportInterval: defaultDropReportInterval,
 	}
 	for _, opt := range opts {
 		if opt != nil {
