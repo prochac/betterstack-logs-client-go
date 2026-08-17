@@ -91,6 +91,16 @@ const (
 // Records rejected by Enqueue with an encoding error are outside this
 // accounting entirely: nothing was ever handed over, and the caller was told
 // synchronously.
+//
+// The identity assumes no Enqueue is still running when Close is called. An
+// Enqueue that passed its closed check just before Close closed the client can
+// complete its hand-off to the queue after Close has counted what was left
+// there; that record is counted Enqueued and nothing else, and the sum is short
+// by it. Enqueue is lock-free by design, so this is a caveat rather than a bug
+// to fix: logging into a client another goroutine is closing is already a race
+// in the caller — the record is delivered or lost depending on the instant it
+// lands — and the counters can only decline to describe it. Let the last
+// Enqueue return before calling Close and the identity is exact.
 type Stats struct {
 	// Enqueued counts records offered to Enqueue, including those refused
 	// because the client was already closed.
@@ -647,6 +657,8 @@ func (c *Client) Flush(ctx context.Context) error {
 // concurrently; every caller gets the same error.
 //
 // After it returns, Enqueue reports ErrClosed and counts the record as dropped.
+// An Enqueue still running when Close is called is a race in the caller: the
+// record may be delivered, dropped, or — see Stats — counted as neither.
 // Close is the one place a delivery error can be surfaced meaningfully, because
 // the caller has a stack to receive it — so it returns one, in addition to the
 // final drop summary sent to OnError.
@@ -685,7 +697,10 @@ func (c *Client) Close() error {
 		}
 
 		// Anything that slipped into the queue between the done check in
-		// Enqueue and now is accounted rather than silently lost.
+		// Enqueue and now is accounted rather than silently lost. This read is
+		// also where the Stats identity's fine print comes from: an Enqueue
+		// still in flight at this point can land its record after the count,
+		// and that record is then Enqueued and nothing else.
 		if leftover := len(c.queue); leftover > 0 {
 			c.stats.droppedClosed.Add(uint64(leftover))
 		}

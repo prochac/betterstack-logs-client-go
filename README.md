@@ -90,6 +90,10 @@ here blocks the caller on the network.
               DroppedRejected + DroppedOversize + DroppedClosed
   ```
 
+  provided the last `Enqueue` returned before `Close` was called — a record
+  handed over by a goroutine racing the shutdown may land after the accounting
+  has closed. See `Stats` for the fine print.
+
 Retries cover transient failures only — 408, 429, 5xx and network errors — with
 exponential backoff, full jitter, and `Retry-After` honoured. A rejected source
 token, an exhausted quota and an unparseable body are terminal: retrying those

@@ -372,6 +372,8 @@ Enqueued == Sent + DroppedQueueFull + DroppedBurst + DroppedBacklog +
 
 For that to hold, `Enqueued` counts records **offered** to `Enqueue`, including those refused with `ErrClosed` after `Close` — a record the caller handed over and that never arrived is a drop whether it was refused at the door or lost later. Records rejected with an encoding error are outside the accounting entirely: nothing was ever handed over, and the caller was told synchronously.
 
+**[amended]** The identity holds *once `Close` has returned* and *provided no `Enqueue` is still running when `Close` is called* — the second half was missing above. `Close` counts the queue's leftovers after the sender has stopped; an `Enqueue` that passed its `done` check just before `Close` closed it can complete its send after that count, leaving one record `Enqueued` and in no other bucket. Closing the identity would mean tracking in-flight `Enqueue` calls — two atomic read-modify-writes on the hot path, on every record, to describe a caller that is already racing its own logging against its own shutdown and losing the record either way. The guarantee is stated with its precondition instead, on `Stats`; `TestStatsBalance` cannot reach the window and does not try.
+
 `Stats()` is cheap (atomics — `sync/atomic.Uint64` fields internally, not bare `uint64`, so there is no 64-bit alignment hazard on 32-bit platforms) and is what makes the client observable from the host application's own metrics — every drop is counted, and no drop is silent.
 
 Typed errors so callers can branch: `*StatusError{StatusCode, Status, Body, Records}`, `*DropError{Records, Reason}`, `ErrClosed`.
