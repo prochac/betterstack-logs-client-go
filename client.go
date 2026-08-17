@@ -223,8 +223,10 @@ func WithMaxBatchBytes(n int) ClientOption {
 // WithMaxQueueSize bounds the queue between Enqueue and the sender, in records.
 // Records offered when the queue is full are dropped and counted, never
 // blocked: Handle runs in the calling application's critical path, so blocking
-// there would turn a Better Stack outage into an application outage. Default
-// 100000, matching the Java client.
+// there would turn a Better Stack outage into an application outage. A record
+// offered to a full queue is not encoded either, so a sustained outage sheds at
+// the cost of a length read per record. Default 100000, matching the Java
+// client.
 func WithMaxQueueSize(n int) ClientOption {
 	return func(c *clientConfig) { c.maxQueueSize = n }
 }
@@ -236,10 +238,16 @@ func WithMaxQueueSize(n int) ClientOption {
 //
 // This is a different limit from WithMaxQueueSize, not a smaller one. The queue
 // sheds when the sender falls behind, so it engages only once the pipeline is
-// saturated — and by then every dropped record has already been converted and
-// encoded on the calling goroutine. Burst protection is a ceiling the operator
-// chooses, applied before that work happens, so a runaway loop logging inside a
-// hot path costs one atomic load per record rather than a JSON encode.
+// saturated; burst protection is a ceiling the operator chooses, enforced
+// whether or not delivery is keeping up.
+//
+// Both refuse a record before it is encoded. What burst protection additionally
+// saves is the queueing itself: a rate the operator has declared unacceptable
+// never reaches the pipeline at all, however healthy delivery is. Note that the
+// atomic load it costs is what a direct Enqueue caller pays; through Handler the
+// record's attributes have already been converted by the time the limiter sees
+// it, since admission is the client's policy and Handler deliberately knows
+// nothing of it beyond Enqueue.
 //
 // It is off by default because the right ceiling is a property of the
 // application, not of the library, and a limit guessed on the application's
@@ -612,9 +620,11 @@ func (cfg *clientConfig) validate() error {
 //
 // It never blocks on the network and never blocks on a full queue: if the
 // application is producing records faster than they can be shipped, the record
-// is dropped and counted rather than stalling the caller. WithBurstProtection,
-// if configured, drops the record earlier still and for a different reason —
-// over the operator's rate ceiling, whether or not delivery is keeping up.
+// is dropped and counted rather than stalling the caller. A record offered to a
+// queue that is already full is refused before it is encoded, so shedding under
+// load costs a length read rather than a marshal. WithBurstProtection, if
+// configured, drops the record earlier still and for a different reason — over
+// the operator's rate ceiling, whether or not delivery is keeping up.
 //
 // A record encoding to more than the API's per-request limit is also refused
 // here, counted DroppedOversize, when that is knowable locally — which it is
@@ -645,6 +655,21 @@ func (c *Client) Enqueue(event map[string]any) error {
 	if c.limiter != nil && !c.limiter.allow() {
 		c.stats.enqueued.Add(1)
 		c.stats.droppedBurst.Add(1)
+		return nil
+	}
+
+	// Also before the encode, and for the same reason: the queue fills when the
+	// application is outrunning the sender, which is exactly when it can least
+	// afford to marshal records for the bin. A queue observed full stays full for
+	// as long as the sender is behind, so the reading is right in the case that
+	// matters. The authoritative drop point is still the non-blocking send below
+	// — this only skips work whose outcome is already known — and both directions
+	// of the race are benign: a record that encodes and drops anyway is the
+	// behaviour this replaces, and one refused although a slot freed a moment
+	// later is indistinguishable from having arrived a moment earlier.
+	if len(c.queue) == cap(c.queue) {
+		c.stats.enqueued.Add(1)
+		c.stats.droppedQueueFull.Add(1)
 		return nil
 	}
 

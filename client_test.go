@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -453,6 +454,74 @@ func TestQueueFullDropsWithoutBlocking(t *testing.T) {
 		t.Error("nothing was dropped despite a queue of 4 and 5000 records with every upload stalled")
 	}
 }
+
+// …and it must drop without paying for the encode first. The queue fills exactly
+// when the application is logging hardest, so marshalling records for the bin is
+// the worst possible time to spend that CPU.
+func TestQueueFullDropSkipsTheEncode(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t, withGate())
+	defer rec.release() // before the server's cleanup, and after Close below
+	enc := &tallyEncoder{Encoder: NDJSON()}
+	c, _ := newTestClient(t, rec,
+		WithEncoder(enc),
+		WithBatchSize(1),
+		WithMaxInFlight(1),
+		WithMaxQueueSize(4),
+		WithShutdownTimeout(100*time.Millisecond), // nothing here is ever delivered
+	)
+	defer c.Close()
+
+	// Wedge the sender: one batch on the worker the gate holds, one in the
+	// hand-off slot behind it, and the third leaves the sender blocked. From
+	// here nothing drains the queue.
+	enqueueN(t, c, 3)
+	waitFor(t, "the upload pool to saturate", func() bool {
+		c.pool.mu.Lock()
+		defer c.pool.mu.Unlock()
+		return c.pool.dispatched == 2
+	})
+
+	// Fill the queue behind the wedge. Driven until a drop proves it full rather
+	// than counted out, because the sender may still be on its way to the batch
+	// it blocks on and would take one more record with it.
+	waitFor(t, "the queue to fill", func() bool {
+		_ = c.Enqueue(event(0))
+		return c.Stats().DroppedQueueFull > 0
+	})
+
+	const offered = 50
+	before := enc.calls()
+	dropped := c.Stats().DroppedQueueFull
+	for i := 0; i < offered; i++ {
+		_ = c.Enqueue(event(i))
+	}
+
+	if got := enc.calls() - before; got != 0 {
+		t.Errorf("AppendRecord ran %d times for %d records offered to a full queue, want 0", got, offered)
+	}
+	// The saving must not have cost the accounting: every one of them is still a
+	// counted drop, which is what keeps the Stats identity whole.
+	if got := c.Stats().DroppedQueueFull - dropped; got != offered {
+		t.Errorf("DroppedQueueFull grew by %d, want %d", got, offered)
+	}
+}
+
+// tallyEncoder counts AppendRecord calls so a test can assert a record never
+// reached the encoder at all. The format is delegated, so the recorder still
+// checks the wire.
+type tallyEncoder struct {
+	Encoder
+	n atomic.Int64
+}
+
+func (e *tallyEncoder) AppendRecord(dst []byte, event map[string]any) ([]byte, error) {
+	e.n.Add(1)
+	return e.Encoder.AppendRecord(dst, event)
+}
+
+func (e *tallyEncoder) calls() uint64 { return uint64(e.n.Load()) }
 
 // --- burst protection -------------------------------------------------------
 

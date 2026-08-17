@@ -73,7 +73,9 @@ here blocks the caller on the network.
 - `Handle` converts and encodes on the calling goroutine, then hands the bytes to
   a bounded queue and returns. It never touches the network.
 - If the application outruns delivery, records are **dropped at the queue and
-  counted** — never blocked. Size it with `WithMaxQueueSize`.
+  counted** — never blocked. A record offered to a queue that is already full is
+  not encoded, so an outage sheds for the price of a length read. Size the queue
+  with `WithMaxQueueSize`.
 - Delivery failures surface through `WithOnError`, not through `Handle`: by the
   time they happen `Handle` has long since returned, and reporting a logging
   failure through the logger would recurse. Drops arrive as aggregated summaries
@@ -81,10 +83,9 @@ here blocks the caller on the network.
   seconds, paced by the client itself, so an outage reports what it is costing
   while it is still going on.
 - `WithBurstProtection` is the other half of that, and is **off by default**: it
-  caps how fast records are admitted at all, before they are encoded, so a
-  runaway loop inside a hot path costs an atomic load per record instead of a
-  JSON marshal. The queue only bounds memory, and only once the burst has
-  already been paid for.
+  caps how fast records are admitted at all, at the cost of an atomic load per
+  record, whether or not delivery is keeping up. The queue sheds only once the
+  sender is behind; this is a ceiling you declare.
 - `Client.Stats()` accounts for every record. After `Close` returns:
 
   ```
