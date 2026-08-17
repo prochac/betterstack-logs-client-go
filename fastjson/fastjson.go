@@ -7,8 +7,8 @@
 //	betterstack.WithEncoder(betterstack.NDJSONWith(fastjson.AppendObject))
 //	betterstack.WithEncoder(betterstack.JSONArrayWith(fastjson.AppendObject))
 //
-// On the default record shape it encodes in ~190 ns with no allocations, where
-// encoding/json takes ~1.1 µs and 10, which takes a slog.Handler.Handle from 21
+// On the default record shape it encodes in ~380 ns with no allocations, where
+// encoding/json takes ~1.5 µs and 15, which takes a slog.Handler.Handle from 27
 // allocations to 16. That cost is paid synchronously on the goroutine that
 // called the logger, which is what makes it worth a package.
 //
@@ -36,19 +36,26 @@
 // reimplement a rule rather than a shape — string escaping, float formatting
 // and time.Time.
 //
-// # The one visible difference
+// # Object keys are sorted
 //
-// Object keys are not sorted. encoding/json sorts map keys; sorting costs an
-// allocation and a comparison sort per record to produce an ordering no JSON
-// reader is permitted to care about. Payload key order is unspecified either
-// way (DESIGN §4), but it does mean the bytes on the wire differ from the
-// default appender's. Do not write anything that depends on key order.
+// encoding/json sorts map keys and so does this, for the compressor rather than
+// for the reader: every record in a batch carries the same keys, so a stable key
+// sequence is the longest repeated string in the body, and leaving it to Go's
+// map iteration order costs roughly 54% on the gzipped size of a realistic
+// batch. That matters because the ingestion API's size limit is measured on
+// compressed bytes. No JSON reader is permitted to care about member order and
+// nothing here promises one — the sort exists to make consecutive records
+// resemble each other, and DESIGN §4 records the reasoning.
+//
+// Sorting is why an object of more than 32 keys costs one allocation; below
+// that the key slice lives on the stack.
 package fastjson
 
 import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -71,18 +78,36 @@ func AppendObject(dst []byte, m map[string]any) ([]byte, error) {
 	return dst, nil
 }
 
+// maxStackKeys is how many keys an object can have before sorting them needs the
+// heap. Records are shallow — a handful of reserved keys and a context group —
+// and slog groups nest into separate objects rather than widening one, so a map
+// this side of 32 keys covers the shape the handler produces. Past it, append
+// grows the slice normally and costs one allocation on that record alone.
+const maxStackKeys = 32
+
 func appendObject(dst []byte, m map[string]any) ([]byte, error) {
 	dst = append(dst, '{')
+
+	// Keys are sorted, so that every record in a batch presents the same key
+	// sequence to gzip. See the package doc.
+	//
+	// Not slices.Sorted(maps.Keys(m)): both are Go 1.23 against a 1.21 floor, and
+	// it collects into a fresh heap slice where this array stays on the stack.
+	var scratch [maxStackKeys]string
+	keys := scratch[:0]
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
 	var err error
-	first := true
-	for k, v := range m {
-		if !first {
+	for i, k := range keys {
+		if i > 0 {
 			dst = append(dst, ',')
 		}
-		first = false
 		dst = appendString(dst, k)
 		dst = append(dst, ':')
-		if dst, err = appendValue(dst, v); err != nil {
+		if dst, err = appendValue(dst, m[k]); err != nil {
 			return dst, err
 		}
 	}

@@ -1,5 +1,3 @@
-//go:build !(go1.27 && goexperiment.jsonv2)
-
 package betterstack
 
 import (
@@ -8,22 +6,24 @@ import (
 	"sync"
 )
 
-// This is the record encoder for every toolchain before Go 1.27, and for any
-// 1.27 build with the json/v2 experiment turned off. json_v2.go is the other
-// half; the two must agree on everything json_contract_test.go asserts.
+// This is the record encoder, on every toolchain. It uses the encoding/json
+// **v1 API** deliberately, and that is a decision rather than an omission — see
+// DESIGN §4, which records that a second implementation over encoding/json/v2
+// was built, measured and reverted.
+//
+// The short version: v1's behaviour is pinned by Go's compatibility promise, so
+// this file needs no build tag, no options, and no test to notice a toolchain
+// change. It sorts map keys, which is worth ~35% on the gzipped body and is the
+// property that made the v2 file a net loss once it had to match. When json/v2
+// becomes the engine underneath this API, all three of those properties come
+// along unchanged.
 //
 // encoding/json cannot walk a map[string]any cheaply — every value is an
 // interface, so the map encoder reflects over each one and boxes it again on
-// the way out, at 13 allocations and ~1.4 µs for the default record shape. That
+// the way out, at 15 allocations and ~1.3 µs for the default record shape. That
 // is the price of the map API (DESIGN §4, "Duplicate keys"), and this file pays
-// it rather than reimplementing JSON to avoid it.
-
-// jsonImplementation names the package this build encodes records with, for
-// TestJSONImplementation. This file is selected whenever goexperiment.jsonv2 is
-// false, which covers a toolchain from before the experiment, one built with
-// GOEXPERIMENT=nojsonv2, and — in future — one where json/v2 has graduated and
-// the flag is gone. The first two want this file; the third does not.
-const jsonImplementation = "encoding/json"
+// it rather than reimplementing JSON to avoid it. The fastjson subpackage is
+// for callers who would rather not: same output, 0 allocations.
 
 // appendJSONObject appends the JSON encoding of m to dst, without a trailing
 // newline.

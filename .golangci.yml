@@ -6,17 +6,14 @@
 #     golangci-lint run ./...
 #     golangci-lint fmt ./...
 #
-# Two blind spots are worth knowing about.
+# One blind spot is worth knowing about: msgpackcompat/ is a separate module, so
+# `./...` does not reach it. Run golangci-lint from inside it; it finds this file
+# by walking up.
 #
-# json_v2.go is behind `go1.27 && goexperiment.jsonv2`, so this run does not
-# compile it — it lints json_stdlib.go and reports success for a package that
-# ships both. Pointing golangci-lint at the newer toolchain does not work
-# either: v2.12 is built with go1.26 and its go/types panics on a 1.27 stdlib.
-# Until that lands, `GOEXPERIMENT=jsonv2 go1.27rc3 vet ./...` is the check that
-# path gets, which is the same floor CLAUDE.md already sets for it.
-#
-# msgpackcompat/ is a separate module, so `./...` does not reach it. Run
-# golangci-lint from inside it; it finds this file by walking up.
+# There used to be a second — a build-tagged json_v2.go this run could not
+# compile. That file is gone (DESIGN §4), so `./...` now lints every line the
+# library ships. Reintroducing a build tag would reintroduce the blind spot,
+# since v2.12 is built with go1.26 and its go/types panics on a 1.27 stdlib.
 version: "2"
 
 # Report everything. The defaults cap a linter at 50 issues and the same issue

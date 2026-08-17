@@ -1,5 +1,3 @@
-//go:build !(go1.27 && goexperiment.jsonv2)
-
 package betterstack
 
 import (
@@ -7,7 +5,7 @@ import (
 	"testing"
 )
 
-// The scratch buffer json_stdlib.go pools only ever grows, so one outsized
+// The scratch buffer json.go pools only ever grows, so one outsized
 // record would otherwise pin its capacity for the life of the process — the
 // slow kind of leak that never shows up in a benchmark and only in a long-lived
 // process that logs the occasional huge value.

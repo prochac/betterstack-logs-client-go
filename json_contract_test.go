@@ -3,78 +3,25 @@ package betterstack
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"math"
 	"reflect"
-	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 )
 
-// The record encoder has two implementations, selected by build tag:
-// json_stdlib.go on every toolchain, json_v2.go from Go 1.27. This file is the
-// contract they share. It runs unchanged under both, and it is the only thing
-// stopping the library from behaving differently depending on which Go built
-// it — a difference nobody would see until a user on the newer toolchain
-// reported missing records.
+// The behaviour json.go's record encoder is held to, asserted against what a
+// consumer decodes rather than against bytes.
 //
-// So the assertions here are about behaviour, never about bytes. Two of them
-// exist because encoding/json/v2's defaults differ from encoding/json's and
-// json_v2.go has to put them back; the rest would hold for any correct
-// implementation, which is what makes them worth asserting.
-//
-// Deliberately not asserted: the order of an object's keys. v1 sorts them, v2
-// does not, and DESIGN §4 leaves payload key order unspecified.
-
-// TestJSONImplementation reports which of the two files this binary was built
-// with, and catches the one case the build tag cannot express: when json/v2
-// graduates, goexperiment.jsonv2 disappears, json_v2.go silently stops being
-// compiled, and everything still passes.
-//
-// runtime.Version() is what makes it detectable — it reports non-default
-// experiments, as "go1.27rc3-X:nojsonv2" — so an explicit opt-out can be told
-// apart from a graduation. On a toolchain new enough for json/v2, taking
-// json_stdlib.go is legitimate only for the former.
-func TestJSONImplementation(t *testing.T) {
-	t.Parallel()
-
-	version := runtime.Version()
-	t.Logf("records are encoded by %s (%s)", jsonImplementation, version)
-
-	usesV2 := jsonImplementation == "encoding/json/v2"
-	optedOut := strings.Contains(version, "nojsonv2")
-
-	switch {
-	case usesV2 && !atLeastGo(1, 27):
-		t.Errorf("json_v2.go was compiled on %s, where encoding/json/v2 is "+
-			"importable but outside the API promise, so a file below go1.27 "+
-			"fails go vet's stdversion on 1.27; the build tag has been "+
-			"widened too far", version)
-	case !usesV2 && atLeastGo(1, 27) && !optedOut:
-		t.Errorf("this build uses %s on %s, which has encoding/json/v2 and did not "+
-			"opt out of it.\nThe goexperiment.jsonv2 tag in json_v2.go has stopped "+
-			"matching — most likely json/v2 graduated and the flag was deleted, in "+
-			"which case that tag becomes a plain //go:build go1.NN. See DESIGN §4.",
-			jsonImplementation, version)
-	}
-}
-
-// atLeastGo reports whether the running toolchain is at least the given
-// release. It reads runtime.Version(), which is "go1.27rc3", "go1.26.6" or, for
-// an unreleased toolchain, something that parses as neither — treated as newer,
-// since a devel build is always ahead of the last release.
-func atLeastGo(major, minor int) bool {
-	v := runtime.Version()
-	if !strings.HasPrefix(v, "go") {
-		return true
-	}
-	var gotMajor, gotMinor int
-	if _, err := fmt.Sscanf(v, "go%d.%d", &gotMajor, &gotMinor); err != nil {
-		return true
-	}
-	return gotMajor > major || (gotMajor == major && gotMinor >= minor)
-}
+// This file was written when there were two implementations behind a build tag
+// — json_stdlib.go and a json_v2.go over encoding/json/v2 — and its job was to
+// stop them drifting. The v2 file has since been removed (DESIGN §4), so the
+// contract now has one implementation to hold, and the reason it is still worth
+// asserting is that these are the properties that made v2 unusable as a
+// drop-in: invalid UTF-8 survives rather than failing the record, a Duration
+// encodes rather than erroring, and keys come out sorted. Any future attempt to
+// swap the encoder has to clear this bar first.
 
 // decodeRecord runs a payload through the encoder under test and returns what a
 // consumer would see.
@@ -99,7 +46,8 @@ func decodeRecord(t *testing.T, payload map[string]any) map[string]any {
 
 // A log message carries whatever bytes the application put in it. Rejecting a
 // record for a stray byte would lose the line, and encoding/json/v2 does
-// exactly that unless told otherwise — see json_v2.go's AllowInvalidUTF8.
+// exactly that by default — which is one of the reasons the v1 API is what this
+// package encodes with (DESIGN §4).
 func TestJSONInvalidUTF8IsSubstitutedNotRejected(t *testing.T) {
 	t.Parallel()
 
@@ -157,6 +105,65 @@ func TestJSONDoesNotEscapeHTML(t *testing.T) {
 	if bytes.Contains(b, []byte(`\u00`)) {
 		t.Errorf("output contains a unicode escape: %s", b)
 	}
+}
+
+// Keys come out sorted, which is the one assertion here that is about bytes
+// rather than about what a consumer decodes — because the consumer that cares
+// is gzip. Every record in a batch carries the same keys, so a stable key
+// sequence is the longest repeated string in the body; leaving it to Go's map
+// iteration order costs ~35% on the compressed size, against a limit the
+// ingestion API measures on compressed bytes.
+//
+// This is a regression guard, not an API promise: nothing about payload key
+// order is documented, and no consumer should depend on it. It exists because
+// the library shipped a release that lost this property without anything
+// failing (DESIGN §4), and it is what would have caught it.
+func TestJSONKeysAreSorted(t *testing.T) {
+	t.Parallel()
+
+	payload := map[string]any{
+		"zulu": 1, "alpha": 2, "mike": 3, "bravo": 4, "yankee": 5,
+		"nested": map[string]any{"delta": 1, "charlie": 2, "echo": 3},
+	}
+
+	b, err := appendJSONObject(nil, payload)
+	if err != nil {
+		t.Fatalf("appendJSONObject: %v", err)
+	}
+
+	for _, keys := range [][]string{
+		{"alpha", "bravo", "mike", "nested", "yankee", "zulu"},
+		{"charlie", "delta", "echo"},
+	} {
+		if !sort.StringsAreSorted(keys) {
+			t.Fatalf("test bug: %v is not the sorted order", keys)
+		}
+		if got := keyOrder(string(b), keys); !reflect.DeepEqual(got, keys) {
+			t.Errorf("keys appear in order %v, want %v\nencoded: %s", got, keys, b)
+		}
+	}
+}
+
+// keyOrder returns the members of want in the order their quoted forms appear
+// in s.
+func keyOrder(s string, want []string) []string {
+	type at struct {
+		key string
+		pos int
+	}
+	found := make([]at, 0, len(want))
+	for _, k := range want {
+		if i := strings.Index(s, `"`+k+`":`); i >= 0 {
+			found = append(found, at{k, i})
+		}
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].pos < found[j].pos })
+
+	got := make([]string, len(found))
+	for i, f := range found {
+		got[i] = f.key
+	}
+	return got
 }
 
 // dt is the field the ingestion API reads. RFC 3339 with nanoseconds is what

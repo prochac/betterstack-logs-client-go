@@ -167,15 +167,15 @@ func TestAppendObjectMatchesEncodingJSON(t *testing.T) {
 				t.Fatalf("AppendObject: %v", err)
 			}
 
-			var gotDec, wantDec any
-			if err := json.Unmarshal(got, &gotDec); err != nil {
-				t.Fatalf("output is not valid JSON: %v\n%s", err, got)
-			}
-			if err := json.Unmarshal(mustRef(t, p), &wantDec); err != nil {
-				t.Fatalf("reference is not valid JSON: %v", err)
-			}
-			if !reflect.DeepEqual(gotDec, wantDec) {
-				t.Errorf("decoded mismatch:\n got %#v\nwant %#v", gotDec, wantDec)
+			// Bytes, not decoded values. This compared decoded values until
+			// both appenders sorted their keys, and that weakness is why the
+			// library shipped a release whose records gzipped ~35% worse with
+			// nothing failing: key order is invisible to a decoder and is the
+			// whole of what the compressor sees. None of these payloads carries
+			// invalid UTF-8, which is the one class where the two legitimately
+			// differ in bytes; FuzzAppendString covers that by decoding.
+			if want := mustRef(t, p); !bytes.Equal(got, want) {
+				t.Errorf("bytes differ from encoding/json:\n got %s\nwant %s", got, want)
 			}
 		})
 	}

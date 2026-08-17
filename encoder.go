@@ -310,15 +310,8 @@ func checkMsgPackMap(b []byte) error {
 }
 
 // appendJSONObject is the default ObjectAppender, used by NDJSON and JSONArray.
-// It has two implementations, selected by build tag:
+// It lives in json.go, over the encoding/json v1 API, on every toolchain — see
+// that file for why there is one implementation and not two.
 //
-//   - json_stdlib.go, on every toolchain, using encoding/json;
-//   - json_v2.go, from Go 1.27, using encoding/json/v2 directly.
-//
-// json_v2.go states what it costs to keep the two agreeing. The two tags must
-// stay exact complements of one another, or a toolchain falls through the gap
-// and the package does not build — which is what happened to Go 1.26 with
-// GOEXPERIMENT=jsonv2.
-//
-// Neither writes a trailing newline: NDJSON's separator is added by the caller
+// It writes no trailing newline: NDJSON's separator is added by the caller
 // above, because the array encoder must not have one.
