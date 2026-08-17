@@ -75,15 +75,19 @@ const (
 	// sender could batch them.
 	DropQueueFull DropReason = iota
 	// DropBacklog means every upload slot was busy and the hand-off to the
-	// uploaders was full, so a completed batch could not be dispatched.
+	// uploaders was full for as long as a caller's Flush context allowed, so a
+	// completed batch could not be dispatched. A batch lost the same way during
+	// shutdown is DropClosed, not this.
 	DropBacklog
 	// DropRejected means the endpoint terminally rejected the batch, or the
 	// retry budget was exhausted.
 	DropRejected
 	// DropOversize means the request exceeded the hard size limit.
 	DropOversize
-	// DropClosed means the records were enqueued after Close, or were still
-	// queued when Close returned.
+	// DropClosed means the records never left because the client shut down:
+	// enqueued after Close, still queued when Close returned, or in flight —
+	// waiting for an upload slot, sleeping in a retry backoff, or mid-request —
+	// when the shutdown deadline expired.
 	DropClosed
 	// DropBurst means the records were over the WithBurstProtection rate
 	// limit. Appended last: the constants are iota-based, so inserting one

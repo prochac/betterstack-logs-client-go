@@ -113,7 +113,12 @@ type Stats struct {
 	DroppedBacklog   uint64 // every upload slot busy and the hand-off full
 	DroppedRejected  uint64 // terminal status, or the retry budget ran out
 	DroppedOversize  uint64 // over the hard request size limit, or a 413
-	DroppedClosed    uint64 // enqueued after Close, or still queued at Close
+	// DroppedClosed counts everything lost to shutdown: enqueued after Close,
+	// still queued when Close returned, or in flight when the shutdown deadline
+	// expired. A batch abandoned mid-backoff or mid-request is counted here and
+	// not DroppedRejected — nothing rejected it — and one abandoned while
+	// waiting for an upload slot here and not DroppedBacklog.
+	DroppedClosed uint64
 }
 
 // counters is the atomic backing for Stats. atomic.Uint64 rather than bare
@@ -712,6 +717,23 @@ func (c *Client) Close() error {
 // Stats returns a snapshot of the client's counters. It is cheap and safe to
 // call at any time, including after Close.
 func (c *Client) Stats() Stats { return c.stats.snapshot() }
+
+// closing reports whether Close has begun.
+//
+// It exists to file drops accurately. A batch lost to a cancelled context is
+// lost for one of two quite different reasons — the process is shutting down,
+// or a live caller's Flush deadline expired — and the context alone cannot say
+// which, since Close performs its final flush through a Flush context of its
+// own. done is closed first by Close and never otherwise, so it is the
+// discriminator.
+func (c *Client) closing() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
+}
 
 // batch is a completed, framed, optionally compressed request body together
 // with the accounting needed to report on it, and the material needed to split

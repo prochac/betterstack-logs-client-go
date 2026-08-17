@@ -359,8 +359,17 @@ func (p *uploadPool) dispatch(ctx context.Context, b *batch) {
 		p.recordDispatch()
 	case <-ctx.Done():
 		// Only reachable at shutdown, or when a caller's Flush context
-		// expires. The batch is lost; account for it.
-		p.c.stats.droppedBacklog.Add(uint64(b.records))
+		// expires. The batch is lost either way, but the two are not the same
+		// drop: at shutdown the full backlog is incidental — the deadline
+		// expired with data still in flight — and an operator reading the
+		// counters afterwards should not be pointed at a backlog that was
+		// never the problem. Only a live client's Flush timing out here is a
+		// genuine DroppedBacklog.
+		if p.c.closing() {
+			p.c.stats.droppedClosed.Add(uint64(b.records))
+		} else {
+			p.c.stats.droppedBacklog.Add(uint64(b.records))
+		}
 	}
 }
 

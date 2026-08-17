@@ -153,6 +153,8 @@ Blocking instead propagates backpressure to the queue, which is where records ar
 
 The wait is bounded by a context — the caller's for an explicit `Flush`, the client's worker context otherwise — so `Close` can cancel a sender parked on a stalled upload. `DroppedBacklog` survives as the counter for that cancellation path.
 
+**[amended] Only a live client's cancellation is `DroppedBacklog`.** The counter is named for a condition, "every upload slot busy and the hand-off full", and during shutdown that condition is incidental: what actually happened is that the shutdown deadline expired with data in flight. Filing it under the backlog points whoever reads the counters after an unclean shutdown at a saturation problem that may not exist. So the branch discriminates on whether `Close` has begun — `done` is closed first by `Close` and never otherwise, which the flush context cannot tell us, since `Close` drains through a `Flush` of its own — and counts `DroppedClosed` when it has. Two paths in `transport.go` moved for the same reason: a batch abandoned mid-backoff or mid-request at shutdown was counted `DroppedRejected`, and nothing had rejected it. `DroppedClosed` is now every record lost to shutdown, wherever in the pipeline it was standing. §5's identity is untouched — the same records, a different bucket.
+
 **[amended] `WithBurstProtection` adds a second place records are shed, and does not contradict the rule above.** That rule is about **backpressure**: shedding because the downstream cannot keep up. There is still exactly one of those, the queue. Burst protection is an **admission ceiling** — a rate the operator declares acceptable, enforced whether or not delivery is keeping up at all, and off unless asked for. The two answer different questions: the queue asks "is the sender behind?", the limiter asks "is this more than I agreed to send?". A client with the limiter disabled, which is every client that has not opted in, behaves exactly as described above.
 
 It sits in `Enqueue`, **before the encode**, which is the entire reason for having it. The queue only fills once a burst has already been converted and marshalled on the calling goroutine, so it bounds memory but not the CPU that a runaway loop inside a hot path burns. Refusing at the gate costs one atomic load. The limiter is a token bucket held as a single monotone timestamp — the theoretical arrival time, with the emission interval `window/max` and the burst tolerance `window` — so its whole state is one `atomic.Int64`, its refusal path performs no write at all, and it needs no array of window slots (the JS client's shape, PARITY §2). Admitting `k` records back to back requires `k·interval ≤ window`, i.e. exactly `max` of them from a full bucket, which is the steady state the JS numbers describe.
@@ -358,7 +360,7 @@ type Stats struct {
     DroppedBacklog   uint64 // all MaxInFlight uploads busy and the hand-off full
     DroppedRejected  uint64 // terminal status, or retry budget exhausted
     DroppedOversize  uint64 // over the hard request limit, or 413
-    DroppedClosed    uint64 // enqueued after Close, or still queued when Close returned
+    DroppedClosed    uint64 // lost to shutdown: after Close, still queued, or in flight
 }
 ```
 

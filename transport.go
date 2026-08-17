@@ -113,8 +113,12 @@ func (w *worker) uploadBy(ctx context.Context, b *batch, deadline time.Time) err
 				break
 			}
 			if err := sleepCtx(ctx, delay); err != nil {
-				// Shutting down. The batch is lost; account for it below.
-				c.stats.droppedRejected.Add(uint64(b.records))
+				// Shutting down: ctx here is always the client's worker
+				// context, which only Close cancels. Nothing rejected this
+				// batch, so it is a shutdown casualty and counted DropClosed —
+				// DropRejected would send whoever reads the counters after an
+				// unclean shutdown looking for a problem at the ingest end.
+				c.stats.droppedClosed.Add(uint64(b.records))
 				return err
 			}
 			c.stats.retries.Add(1)
@@ -129,7 +133,9 @@ func (w *worker) uploadBy(ctx context.Context, b *batch, deadline time.Time) err
 				// The parent context is done, so this is shutdown rather than
 				// a per-attempt timeout. Checking the parent, rather than
 				// inspecting the error, is what reliably distinguishes them.
-				c.stats.droppedRejected.Add(uint64(b.records))
+				// A shutdown casualty, not a rejection — see the backoff branch
+				// above.
+				c.stats.droppedClosed.Add(uint64(b.records))
 				return err
 			}
 			lastErr = err

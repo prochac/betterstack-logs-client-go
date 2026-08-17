@@ -191,6 +191,121 @@ func TestCloseIsQuietWhenNothingDropped(t *testing.T) {
 	}
 }
 
+// Everything abandoned because the shutdown deadline expired is counted
+// DropClosed, wherever in the pipeline it was standing. The three places a
+// batch can be lost that way — sleeping out a retry backoff, in a request, and
+// waiting for an upload slot — used to be filed as "rejected by ingest" and
+// "upload backlog full", both of which point a post-mortem at a problem that
+// was not there: nothing rejected these batches, and the backlog was full only
+// because the process was already on its way out.
+func TestShutdownCasualtiesAreCountedClosed(t *testing.T) {
+	t.Parallel()
+
+	// A Retry-After is honoured verbatim, with no jitter, so the worker parks
+	// for ten seconds inside a hundred-millisecond shutdown: the cancellation
+	// lands in the backoff sleep every time.
+	rec := newRecorder(t, withStatuses(429), withResponseHeader("Retry-After", "10"))
+	c, errs := newTestClient(t, rec,
+		WithBatchSize(1),
+		WithMaxInFlight(1),
+		WithRetryCeiling(time.Minute), // long enough that the wait is taken
+		WithShutdownTimeout(100*time.Millisecond),
+	)
+
+	// Three batches, one per record, for the three losing paths: the first is
+	// in the worker, the second in the single hand-off slot behind it, and the
+	// third leaves the sender blocked in dispatch with nowhere to put it.
+	enqueueN(t, c, 3)
+	rec.waitForRequests(t, 1)
+	waitFor(t, "the upload pool to saturate", func() bool {
+		c.pool.mu.Lock()
+		defer c.pool.mu.Unlock()
+		return c.pool.dispatched == 2
+	})
+
+	_ = c.Close() // returns an error: nothing was delivered
+
+	s := c.Stats()
+	if s.DroppedClosed != 3 {
+		t.Errorf("Stats().DroppedClosed = %d, want 3: %+v", s.DroppedClosed, s)
+	}
+	if s.DroppedRejected != 0 {
+		t.Errorf("Stats().DroppedRejected = %d, want 0: nothing rejected these batches", s.DroppedRejected)
+	}
+	if s.DroppedBacklog != 0 {
+		t.Errorf("Stats().DroppedBacklog = %d, want 0: the backlog was incidental to the shutdown", s.DroppedBacklog)
+	}
+	assertStatsBalance(t, c)
+
+	var summary *DropError
+	for _, err := range errs.all() {
+		var de *DropError
+		if errors.As(err, &de) && de.Reason == DropClosed {
+			summary = de
+		}
+	}
+	if summary == nil || summary.Records != 3 {
+		t.Errorf("final summary = %v, want 3 records dropped as %v: %v", summary, DropClosed, errs.all())
+	}
+}
+
+// The other side of the same discrimination: a live client whose Flush deadline
+// expires with every upload slot taken has a genuine backlog, and must still be
+// counted as one.
+func TestFlushTimeoutIsCountedBacklog(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t, withGate())
+	c, _ := newTestClient(t, rec,
+		WithBatchSize(1000), // nothing dispatches except through a Flush
+		WithMaxInFlight(1),
+	)
+
+	// Saturate the pool one batch at a time: the first goes to the worker,
+	// which the gate holds, the second to the single hand-off slot behind it.
+	// Both Flushes wait for uploads that will not finish until release, so they
+	// run in the background.
+	for i := 0; i < 2; i++ {
+		if err := c.Enqueue(event(i)); err != nil {
+			t.Fatalf("Enqueue(%d): %v", i, err)
+		}
+		go func() { _ = c.Flush(context.Background()) }()
+		want := uint64(i + 1)
+		waitFor(t, "the batch to be dispatched", func() bool {
+			c.pool.mu.Lock()
+			defer c.pool.mu.Unlock()
+			return c.pool.dispatched == want
+		})
+	}
+
+	// This one has nowhere to go, and its deadline is the caller's.
+	if err := c.Enqueue(event(2)); err != nil {
+		t.Fatalf("Enqueue(2): %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := c.Flush(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Flush = %v, want the deadline to have expired", err)
+	}
+
+	// Flush and the sender wake on the same expiry, and Flush usually wins the
+	// race back, so the count lands a moment later. Polled rather than slept
+	// on; if it is ever filed as a shutdown drop instead, this is where the
+	// test fails.
+	waitFor(t, "the abandoned batch to be counted as a backlog drop", func() bool {
+		return c.Stats().DroppedBacklog == 1
+	})
+	if got := c.Stats().DroppedClosed; got != 0 {
+		t.Errorf("Stats().DroppedClosed = %d, want 0: the client is not closing", got)
+	}
+
+	rec.release()
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	assertStatsBalance(t, c)
+}
+
 // --- option coverage --------------------------------------------------------
 
 func TestWithEncoder(t *testing.T) {
