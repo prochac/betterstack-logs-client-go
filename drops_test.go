@@ -614,20 +614,37 @@ func TestOversizeBatchIsSplitBeforeSending(t *testing.T) {
 // cannot be split, and the server would reject it, so spending a request and a
 // retry budget to find that out wastes the customer's quota and delays
 // everything behind it.
+//
+// The record here fits by itself and is pushed over by the framing, which is
+// what keeps this on the sender's check rather than Enqueue's: Enqueue judges
+// the record, dispatch judges the finished body, and only the second one can
+// see what framing and compression did to it.
 func TestOversizeRecordIsDroppedBeforeSending(t *testing.T) {
 	t.Parallel()
 
+	enc := JSONArray() // frames a one-record batch to exactly one byte more
 	rec := newRecorder(t)
 	c, errs := newTestClient(t, rec,
 		WithBatchSize(1),
+		WithEncoder(enc),
 		WithCompression(CompressionNone), // so the body size is predictable
 		WithMaxBatchBytes(hardMaxRequestBytes*2),
 	)
 	defer c.Close()
 
-	huge := strings.Repeat("x", hardMaxRequestBytes+(1<<20))
+	// Exactly at the limit: every added "x" is one more byte of JSON, so the
+	// padding needed is the difference from an empty message.
+	empty, err := enc.AppendRecord(nil, map[string]any{KeyMessage: "", KeyLevel: "INFO"})
+	if err != nil {
+		t.Fatalf("sizing the record: %v", err)
+	}
+	huge := strings.Repeat("x", hardMaxRequestBytes-len(empty))
 	if err := c.Enqueue(map[string]any{KeyMessage: huge, KeyLevel: "INFO"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
+	}
+	if got := c.Stats().DroppedOversize; got != 0 {
+		t.Fatalf("Stats().DroppedOversize = %d before the flush, want 0: "+
+			"Enqueue refused a record that fits, so this no longer tests the sender", got)
 	}
 	if err := c.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
@@ -648,6 +665,79 @@ func TestOversizeRecordIsDroppedBeforeSending(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("no oversize drop reported: %v", errs.all())
+	}
+}
+
+// The same doomed record, refused a stage earlier. With compression off the
+// encoded size is the deciding one, so Enqueue can tell it will never fit
+// without the record taking a queue slot and forcing its capacity on the
+// sender's accumulation buffer and the packer's scratch for the life of the
+// client. The proof that it never got that far is that the count is already
+// there with nothing yet flushed and the sender never woken.
+func TestOversizeRecordIsRefusedAtEnqueue(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, errs := newTestClient(t, rec,
+		WithBatchSize(1000), // so nothing here would flush on its own
+		WithCompression(CompressionNone),
+		withDropReportInterval(20*time.Millisecond),
+	)
+	defer c.Close()
+
+	huge := strings.Repeat("x", hardMaxRequestBytes+(1<<20))
+	if err := c.Enqueue(map[string]any{KeyMessage: huge, KeyLevel: "INFO"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if got := c.Stats().DroppedOversize; got != 1 {
+		t.Errorf("Stats().DroppedOversize = %d immediately after Enqueue, want 1: "+
+			"the record was queued rather than refused on the caller's goroutine", got)
+	}
+	if err := c.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := rec.count(); got != 0 {
+		t.Errorf("got %d requests, want 0: a doomed body was sent anyway", got)
+	}
+	if got := c.Stats().DroppedOversize; got != 1 {
+		t.Errorf("Stats().DroppedOversize = %d after Flush, want 1: counted twice", got)
+	}
+	// Aggregated, not reported inline: a drop discovered on the caller's
+	// goroutine goes through the summary like every other one, so the sender's
+	// ticker is what delivers it.
+	waitFor(t, "an oversize drop summary", func() bool {
+		return hasDrop(errs, DropOversize)
+	})
+}
+
+// Why that refusal is conditional on compression being off: gzipped, a record
+// several times the request limit fits with room to spare, so judging one on
+// its encoded size would throw away records the server is happy to take. This
+// is the test that fails if the Enqueue check is ever made unconditional.
+func TestCompressibleOversizeRecordStillShips(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, errs := newTestClient(t, rec, WithBatchSize(1)) // gzip, the default
+	defer c.Close()
+
+	huge := strings.Repeat("x", hardMaxRequestBytes+(1<<20))
+	if err := c.Enqueue(map[string]any{KeyMessage: huge, KeyLevel: "INFO"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := c.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	if got := c.Stats().DroppedOversize; got != 0 {
+		t.Errorf("Stats().DroppedOversize = %d, want 0: it compressed to well under the limit", got)
+	}
+	if got := c.Stats().Sent; got != 1 {
+		t.Errorf("Stats().Sent = %d, want 1", got)
+	}
+	if got := errs.len(); got != 0 {
+		t.Errorf("OnError fired %d times: %v", got, errs.all())
 	}
 }
 

@@ -616,6 +616,11 @@ func (cfg *clientConfig) validate() error {
 // if configured, drops the record earlier still and for a different reason —
 // over the operator's rate ceiling, whether or not delivery is keeping up.
 //
+// A record encoding to more than the API's per-request limit is also refused
+// here, counted DroppedOversize, when that is knowable locally — which it is
+// only with WithCompression(CompressionNone). Compressed, the same record is
+// judged on its finished body by the sender, or by the server.
+//
 // The returned error is local only — an encoding failure, or ErrClosed after
 // Close. A dropped record is not an error return: doing that would report every
 // drop through Handle, and so through any error-handling middleware, once per
@@ -653,6 +658,25 @@ func (c *Client) Enqueue(event map[string]any) error {
 	}
 
 	c.stats.enqueued.Add(1)
+
+	// A record that cannot fit in a request of its own is refused here rather
+	// than after it has taken a queue slot and been copied into the sender's
+	// accumulation buffer and the packer's framing scratch — both of which keep
+	// the capacity a multi-megabyte record forces on them for the life of the
+	// client — only to meet the same limit in dispatch, which cannot split a
+	// batch of one. Same reason, same count, several copies earlier.
+	//
+	// Sound only with compression off, where the body is the records plus
+	// framing and framing never shrinks them. With gzip how much fits is not
+	// knowable here at all: the limit is measured on the compressed body, and a
+	// record many times this size routinely compresses well under it. That case
+	// stays where it was — the sender's check on the finished body, and failing
+	// that the server's 413.
+	if c.cfg.compression == CompressionNone && len(buf) > hardMaxRequestBytes {
+		c.stats.droppedOversize.Add(1)
+		return nil
+	}
+
 	select {
 	case c.queue <- buf:
 		return nil
