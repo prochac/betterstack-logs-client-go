@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -18,6 +19,8 @@ const (
 	// maxRetryAfter caps what a Retry-After header can ask for, so a hostile or
 	// mistaken value cannot stall shutdown.
 	maxRetryAfter = 60 * time.Second
+	// maxDurationSeconds is the largest whole second a time.Duration holds.
+	maxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
 	// bodySnippetBytes is how much of an error response is kept for the error
 	// message.
 	bodySnippetBytes = 4 << 10
@@ -335,6 +338,15 @@ func parseRetryAfter(h string, now time.Time) time.Duration {
 	if secs, err := strconv.Atoi(h); err == nil {
 		if secs <= 0 {
 			return 0
+		}
+		// Saturate rather than multiply into an overflow. Past ~292 years the
+		// product wraps negative, and a negative duration reads to backoff as
+		// "no Retry-After at all" — an instant retry where the server asked for
+		// the longest wait it could express. Anything this far out is nonsense
+		// either way, and backoff caps every value at maxRetryAfter, so the
+		// clamp only keeps the arithmetic honest on the way there.
+		if int64(secs) > maxDurationSeconds {
+			return time.Duration(math.MaxInt64)
 		}
 		return time.Duration(secs) * time.Second
 	}

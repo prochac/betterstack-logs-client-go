@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"math/rand"
 	"net/http"
 	"strings"
@@ -118,6 +119,10 @@ func TestBackoffRetryAfterOverrides(t *testing.T) {
 	if got := backoff(time.Second, 1, 24*time.Hour, rnd); got != maxRetryAfter {
 		t.Errorf("backoff with an absurd Retry-After = %v, want it capped at %v", got, maxRetryAfter)
 	}
+	// Including one so absurd that parsing it saturates.
+	if got := backoff(time.Second, 1, time.Duration(math.MaxInt64), rnd); got != maxRetryAfter {
+		t.Errorf("backoff with a saturated Retry-After = %v, want it capped at %v", got, maxRetryAfter)
+	}
 }
 
 func TestParseRetryAfter(t *testing.T) {
@@ -133,6 +138,12 @@ func TestParseRetryAfter(t *testing.T) {
 		{"0", 0},
 		{"-1", 0},
 		{"not-a-number", 0},
+		// Long, but faithfully parsed: the cap belongs to backoff, not here.
+		{"86400", 24 * time.Hour},
+		// Past what a Duration can hold, so it saturates. Multiplying would
+		// wrap negative, which backoff reads as "no Retry-After" and retries
+		// immediately — the opposite of what the header asked for.
+		{"99999999999", time.Duration(math.MaxInt64)},
 		{now.Add(30 * time.Second).Format(http.TimeFormat), 30 * time.Second},
 		{now.Add(-30 * time.Second).Format(http.TimeFormat), 0}, // already past
 	}
