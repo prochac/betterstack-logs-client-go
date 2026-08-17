@@ -8,26 +8,26 @@ All defaults below are quoted from the sources listed at the bottom. Where a doc
 
 From the [HTTP REST API docs](https://betterstack.com/docs/logs/http-rest-api/):
 
-| Aspect | Spec |
-| --- | --- |
-| Request | `POST https://$INGESTING_HOST` (this repo defaults to `https://in.logs.betterstack.com/`) |
-| Auth | `Authorization: Bearer $SOURCE_TOKEN` |
-| Body encodings | `application/json` (single object **or** array), `application/x-ndjson`, `application/msgpack` |
-| Timestamp | `dt` — UNIX seconds/millis/nanos, RFC 3339 / ISO 8601 string, or MessagePack timestamp ext. Unparseable values are stored as a plain string and the server's reception time is used instead |
-| Attributes | Arbitrary nested objects allowed alongside `message` |
-| Size limits | 10 MiB compressed per request; 10 MiB uncompressed per record, **≤100 KiB per record recommended** |
-| Rate limits | "There is no limit to the number of requests" |
+| Aspect         | Spec                                                                                                                                                                                        |
+|----------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Request        | `POST https://$INGESTING_HOST` (this repo defaults to `https://in.logs.betterstack.com/`)                                                                                                   |
+| Auth           | `Authorization: Bearer $SOURCE_TOKEN`                                                                                                                                                       |
+| Body encodings | `application/json` (single object **or** array), `application/x-ndjson`, `application/msgpack`                                                                                              |
+| Timestamp      | `dt` — UNIX seconds/millis/nanos, RFC 3339 / ISO 8601 string, or MessagePack timestamp ext. Unparseable values are stored as a plain string and the server's reception time is used instead |
+| Attributes     | Arbitrary nested objects allowed alongside `message`                                                                                                                                        |
+| Size limits    | 10 MiB compressed per request; 10 MiB uncompressed per record, **≤100 KiB per record recommended**                                                                                          |
+| Rate limits    | "There is no limit to the number of requests"                                                                                                                                               |
 
 Response codes and the correct client reaction:
 
-| Code | Meaning | Retryable? |
-| --- | --- | --- |
-| `202` | Accepted | — |
-| `402` | Quota exceeded | No — backoff hard / surface to user |
-| `403` | `Unauthorized` (bad token) | **No** — retrying burns quota forever |
-| `406` | `Couldn't parse JSON content.` | **No** — client-side bug, drop and report |
-| `413` | Payload reached size limit | **No** as-is — split the batch and resend |
-| 5xx / network | — | Yes, with backoff |
+| Code          | Meaning                        | Retryable?                                |
+|---------------|--------------------------------|-------------------------------------------|
+| `202`         | Accepted                       | —                                         |
+| `402`         | Quota exceeded                 | No — backoff hard / surface to user       |
+| `403`         | `Unauthorized` (bad token)     | **No** — retrying burns quota forever     |
+| `406`         | `Couldn't parse JSON content.` | **No** — client-side bug, drop and report |
+| `413`         | Payload reached size limit     | **No** as-is — split the batch and resend |
+| 5xx / network | —                              | Yes, with backoff                         |
 
 The API page does not document 401/429/5xx or a `Content-Encoding` header, but the official Node transport sends `Content-Encoding: gzip`, and the 10 MiB limit is specified on *compressed* data — so gzip is accepted in practice.
 
@@ -44,56 +44,56 @@ The API page does not document 401/429/5xx or a `Content-Encoding` header, but t
 
 Defaults straight from `packages/core/src/base.ts`:
 
-| Option | Default | Notes |
-| --- | --- | --- |
-| `endpoint` | `https://in.logs.betterstack.com` | |
-| `batchSize` | `1000` | flush trigger by count |
-| `batchSizeKiB` | `0` | flush trigger by serialized size, 0 = disabled |
-| `batchInterval` | `1000` (ms) | flush trigger by time |
-| `retryCount` | `3` | |
-| `retryBackoff` | `100` (ms) | minimum wait before retry |
-| `syncMax` | `5` | max concurrent in-flight requests |
-| `syncQueuedMax` | `100` | queued requests beyond this are **dropped** |
-| `burstProtectionMilliseconds` | `5000` | burst window |
-| `burstProtectionMax` | `10000` | max logs accepted per window |
-| `ignoreExceptions` | `false` | swallow send errors (takes precedence) |
-| `throwExceptions` | `false` | raise send errors to the caller |
-| `contextObjectMaxDepth` | `50` | + `contextObjectMaxDepthWarn: true` |
-| `contextObjectCircularRefWarn` | `true` | |
-| `sendLogsToConsoleOutput` | `false` | mirror to stdout |
-| `sendLogsToBetterStack` | `true` | kill switch, useful in tests |
-| `captureStackContext` | `true` | auto file/line/method |
-| `timeout` (node only) | 30 s in transport | 0 disables |
-| `useIPv6` (node only) | IPv4 (`family: 4`) | |
+| Option                         | Default                           | Notes                                          |
+|--------------------------------|-----------------------------------|------------------------------------------------|
+| `endpoint`                     | `https://in.logs.betterstack.com` |                                                |
+| `batchSize`                    | `1000`                            | flush trigger by count                         |
+| `batchSizeKiB`                 | `0`                               | flush trigger by serialized size, 0 = disabled |
+| `batchInterval`                | `1000` (ms)                       | flush trigger by time                          |
+| `retryCount`                   | `3`                               |                                                |
+| `retryBackoff`                 | `100` (ms)                        | minimum wait before retry                      |
+| `syncMax`                      | `5`                               | max concurrent in-flight requests              |
+| `syncQueuedMax`                | `100`                             | queued requests beyond this are **dropped**    |
+| `burstProtectionMilliseconds`  | `5000`                            | burst window                                   |
+| `burstProtectionMax`           | `10000`                           | max logs accepted per window                   |
+| `ignoreExceptions`             | `false`                           | swallow send errors (takes precedence)         |
+| `throwExceptions`              | `false`                           | raise send errors to the caller                |
+| `contextObjectMaxDepth`        | `50`                              | + `contextObjectMaxDepthWarn: true`            |
+| `contextObjectCircularRefWarn` | `true`                            |                                                |
+| `sendLogsToConsoleOutput`      | `false`                           | mirror to stdout                               |
+| `sendLogsToBetterStack`        | `true`                            | kill switch, useful in tests                   |
+| `captureStackContext`          | `true`                            | auto file/line/method                          |
+| `timeout` (node only)          | 30 s in transport                 | 0 disables                                     |
+| `useIPv6` (node only)          | IPv4 (`family: 4`)                |                                                |
 
 Transport: MessagePack → gzip → `POST`, `User-Agent: logtail-js(node)`, non-2xx rejects. `flush()` is public and documented as required before process exit.
 
 ### Java — `com.logtail:logback-logtail`
 
-| Option | Default |
-| --- | --- |
-| `ingestUrl` | `https://in.logs.betterstack.com` |
-| `batchSize` | `1000` |
-| `batchInterval` | `3000` ms |
-| `maxQueueSize` | `100000` — "messages over the limit will be dropped" |
-| `maxRetries` | `5` |
-| `retrySleepMilliseconds` | `300` |
-| `connectTimeout` | `5000` ms |
-| `readTimeout` | `10000` ms |
+| Option                   | Default                                              |
+|--------------------------|------------------------------------------------------|
+| `ingestUrl`              | `https://in.logs.betterstack.com`                    |
+| `batchSize`              | `1000`                                               |
+| `batchInterval`          | `3000` ms                                            |
+| `maxQueueSize`           | `100000` — "messages over the limit will be dropped" |
+| `maxRetries`             | `5`                                                  |
+| `retrySleepMilliseconds` | `300`                                                |
+| `connectTimeout`         | `5000` ms                                            |
+| `readTimeout`            | `10000` ms                                           |
 
 Plus `mdcFields` / `mdcTypes` (string, boolean, int, long) for context enrichment, `appName` for indexing, `objectMapperModule` for custom Jackson serializers, and JSON-tail parsing into a `message_json` field.
 
 ### Erlang
 
-| Option | Default |
-| --- | --- |
-| `upload_batch_max_size` | `50` |
-| `upload_batch_inteval_ms` | `5000` (typo is theirs) |
-| `upload_failed_retry_count` | `3` |
-| `upload_failed_retry_delay_ms` | `1000` |
-| `http_pool_options.timeout` | `15000` ms |
-| `http_pool_options.max_connections` | `10` |
-| `extra_fields` | — key/value pairs appended to **every** event |
+| Option                              | Default                                       |
+|-------------------------------------|-----------------------------------------------|
+| `upload_batch_max_size`             | `50`                                          |
+| `upload_batch_inteval_ms`           | `5000` (typo is theirs)                       |
+| `upload_failed_retry_count`         | `3`                                           |
+| `upload_failed_retry_delay_ms`      | `1000`                                        |
+| `http_pool_options.timeout`         | `15000` ms                                    |
+| `http_pool_options.max_connections` | `10`                                          |
+| `extra_fields`                      | — key/value pairs appended to **every** event |
 
 ### Ruby / Rails, Python, PHP, .NET — thinner docs, but consistent themes
 
@@ -180,11 +180,11 @@ Batching splits errors into two classes that must be surfaced differently:
 
 Three established shapes for that channel:
 
-| Pattern | Example | Trade-off |
-| --- | --- | --- |
-| Global error handler | OTel `otel.Handle(err)` → `otel.SetErrorHandler`, default logs to stderr; used by `sdk/log`'s `BatchProcessor` (`batch.go:107`, `:211`) | Zero config, but global mutable state |
-| Per-instance error sink | zap `zap.ErrorOutput(zapcore.WriteSyncer)`, stderr by default | Explicit, no globals |
-| Callback | `slogmulti.RecoveryFunc(ctx, record, err)` | Most flexible; matches this repo's option-struct style |
+| Pattern                 | Example                                                                                                                                 | Trade-off                                              |
+|-------------------------|-----------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------|
+| Global error handler    | OTel `otel.Handle(err)` → `otel.SetErrorHandler`, default logs to stderr; used by `sdk/log`'s `BatchProcessor` (`batch.go:107`, `:211`) | Zero config, but global mutable state                  |
+| Per-instance error sink | zap `zap.ErrorOutput(zapcore.WriteSyncer)`, stderr by default                                                                           | Explicit, no globals                                   |
+| Callback                | `slogmulti.RecoveryFunc(ctx, record, err)`                                                                                              | Most flexible; matches this repo's option-struct style |
 
 **Recommendation**: `Option.OnError func(error)`, defaulting to a stderr write. Match `slogmulti.RecoveryFunc`'s argument order if a record is ever included.
 
@@ -205,13 +205,13 @@ otelslog.NewHandler("my/pkg", otelslog.WithLoggerProvider(provider))
 
 The full stack:
 
-| Layer | Package | Responsibility |
-| --- | --- | --- |
-| `otelslog.Handler` | `contrib/bridges/otelslog` | slog→OTel record conversion. Nothing else. |
-| `log.Logger` | `otel/log` | Bridge-author API; `Emit(ctx, Record)` |
-| `LoggerProvider` | `otel/sdk/log` | Owns the pipeline; `Shutdown` / `ForceFlush` live here |
-| `Processor` | `otel/sdk/log` | `Enabled` / `OnEmit` / `Shutdown` / `ForceFlush` — `BatchProcessor` (queue, batching, drop accounting) |
-| `Exporter` | `otel/sdk/log` | `Export(ctx, []Record) error` / `Shutdown` / `ForceFlush` — the wire, encoding, **and retry** |
+| Layer              | Package                    | Responsibility                                                                                         |
+|--------------------|----------------------------|--------------------------------------------------------------------------------------------------------|
+| `otelslog.Handler` | `contrib/bridges/otelslog` | slog→OTel record conversion. Nothing else.                                                             |
+| `log.Logger`       | `otel/log`                 | Bridge-author API; `Emit(ctx, Record)`                                                                 |
+| `LoggerProvider`   | `otel/sdk/log`             | Owns the pipeline; `Shutdown` / `ForceFlush` live here                                                 |
+| `Processor`        | `otel/sdk/log`             | `Enabled` / `OnEmit` / `Shutdown` / `ForceFlush` — `BatchProcessor` (queue, batching, drop accounting) |
+| `Exporter`         | `otel/sdk/log`             | `Export(ctx, []Record) error` / `Shutdown` / `ForceFlush` — the wire, encoding, **and retry**          |
 
 Four details worth stealing outright:
 
@@ -250,9 +250,9 @@ Unchanged by any of this: the go 1.21 floor, and the MIT notice (© 2023 Samuel 
 
 ### Naming, from their own convention
 
-| Era | Convention | Examples |
-| --- | --- | --- |
-| Legacy (Logtail brand) | `logtail/logtail-<language>` | `logtail-js`, `logtail-python`, `logtail-ruby` |
+| Era                          | Convention                           | Examples                                                                                               |
+|------------------------------|--------------------------------------|--------------------------------------------------------------------------------------------------------|
+| Legacy (Logtail brand)       | `logtail/logtail-<language>`         | `logtail-js`, `logtail-python`, `logtail-ruby`                                                         |
 | Current (Better Stack brand) | `BetterStackHQ/logs-client-<target>` | `logs-client-nlog`, `logs-client-serilog` — the replacements for the archived `logtail/logtail-dotnet` |
 
 Their Go module paths are **lowercase** regardless of the org's display casing: `module github.com/betterstackhq/terraform-provider-logtail`.

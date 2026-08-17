@@ -63,26 +63,26 @@ Separate `ClientOption` and `HandlerOption` types so the compiler enforces which
 
 ### Client options and defaults
 
-| Option | Default | Source |
-| --- | --- | --- |
-| `WithEndpoint(string)` | `https://in.logs.betterstack.com` | PARITY §1 |
-| `WithBatchSize(int)` | `1000` | JS + Java agree |
-| `WithBatchInterval(time.Duration)` | `1s` | JS; Java is 3 s, and 1 s is the better single-timer value (PARITY §4) |
-| `WithMaxBatchBytes(int)` | `5 MiB` | conservative against the 10 MiB compressed limit |
-| `WithMaxQueueSize(int)` | `100_000` records | Java `maxQueueSize`, drop over |
-| `WithBurstProtection(int, time.Duration)` | disabled | JS `burstProtectionMax` / `burstProtectionMilliseconds`, `10_000` / `5s` (PARITY §2) |
-| `WithMaxRetries(int)` | `5` | Java |
-| `WithRetryBackoff(time.Duration)` | `300ms` base | Java |
-| `WithRetryCeiling(time.Duration)` | `60s` | total elapsed per batch; OTel `otlploghttp` (§5) |
-| `WithMaxInFlight(int)` | `5` | JS `syncMax` |
-| `WithTimeout(time.Duration)` | `10s` | per request, Java `readTimeout` |
-| `WithConnectTimeout(time.Duration)` | `5s` | Java |
-| `WithHTTPClient(*http.Client)` | tuned internal client | escape hatch; disables the two timeout options |
-| `WithCompression(Compression)` | `CompressionGzip` | `CompressionNone` to disable |
-| `WithEncoder(Encoder)` | `NDJSON` | §4 — also `JSONArray`, `MsgPack(Marshaler)` |
-| `WithOnError(func(error))` | write to `os.Stderr` | PARITY §5 |
-| `WithShutdownTimeout(time.Duration)` | `15s` | used by `Close` |
-| `WithDryRun(bool)` | `false` | JS `sendLogsToBetterStack` kill switch |
+| Option                                    | Default                           | Source                                                                               |
+|-------------------------------------------|-----------------------------------|--------------------------------------------------------------------------------------|
+| `WithEndpoint(string)`                    | `https://in.logs.betterstack.com` | PARITY §1                                                                            |
+| `WithBatchSize(int)`                      | `1000`                            | JS + Java agree                                                                      |
+| `WithBatchInterval(time.Duration)`        | `1s`                              | JS; Java is 3 s, and 1 s is the better single-timer value (PARITY §4)                |
+| `WithMaxBatchBytes(int)`                  | `5 MiB`                           | conservative against the 10 MiB compressed limit                                     |
+| `WithMaxQueueSize(int)`                   | `100_000` records                 | Java `maxQueueSize`, drop over                                                       |
+| `WithBurstProtection(int, time.Duration)` | disabled                          | JS `burstProtectionMax` / `burstProtectionMilliseconds`, `10_000` / `5s` (PARITY §2) |
+| `WithMaxRetries(int)`                     | `5`                               | Java                                                                                 |
+| `WithRetryBackoff(time.Duration)`         | `300ms` base                      | Java                                                                                 |
+| `WithRetryCeiling(time.Duration)`         | `60s`                             | total elapsed per batch; OTel `otlploghttp` (§5)                                     |
+| `WithMaxInFlight(int)`                    | `5`                               | JS `syncMax`                                                                         |
+| `WithTimeout(time.Duration)`              | `10s`                             | per request, Java `readTimeout`                                                      |
+| `WithConnectTimeout(time.Duration)`       | `5s`                              | Java                                                                                 |
+| `WithHTTPClient(*http.Client)`            | tuned internal client             | escape hatch; disables the two timeout options                                       |
+| `WithCompression(Compression)`            | `CompressionGzip`                 | `CompressionNone` to disable                                                         |
+| `WithEncoder(Encoder)`                    | `NDJSON`                          | §4 — also `JSONArray`, `MsgPack(Marshaler)`                                          |
+| `WithOnError(func(error))`                | write to `os.Stderr`              | PARITY §5                                                                            |
+| `WithShutdownTimeout(time.Duration)`      | `15s`                             | used by `Close`                                                                      |
+| `WithDryRun(bool)`                        | `false`                           | JS `sendLogsToBetterStack` kill switch                                               |
 
 **[amended] `WithBurstProtection` is off by default**, where every other option ships the sibling clients' number. JavaScript is the only official client with the feature and enables it at 10 000 records per 5 s — a 2 000 rec/s ceiling calibrated for Node's throughput, which a Go service can exceed without anything being wrong. A default that silently discards a correctly-behaving application's logs is the same class of surprise as a default level of `Debug`, and §2 has already rejected that. The right ceiling is a property of the application, so the library declines to guess one and the docs quote JS's numbers as a starting point instead.
 
@@ -92,14 +92,14 @@ The two values are one option, not two. Neither means anything alone — a maxim
 
 ### Handler options and defaults
 
-| Option | Default |
-| --- | --- |
-| `WithLevel(slog.Leveler)` | `slog.LevelInfo` |
-| `WithAddSource(bool)` | `false` |
-| `WithReplaceAttr(func([]string, slog.Attr) slog.Attr)` | nil |
-| `WithAttrFromContext(...func(context.Context) []slog.Attr)` | none |
-| `WithExtraFields(map[string]any)` | none — merged into every record (Erlang `extra_fields`, Java `appName`) |
-| `WithFilter(func(context.Context, slog.Record) bool)` | none — send-time predicate, **true means send** (Ruby `filter_sent_to_better_stack`) |
+| Option                                                      | Default                                                                              |
+|-------------------------------------------------------------|--------------------------------------------------------------------------------------|
+| `WithLevel(slog.Leveler)`                                   | `slog.LevelInfo`                                                                     |
+| `WithAddSource(bool)`                                       | `false`                                                                              |
+| `WithReplaceAttr(func([]string, slog.Attr) slog.Attr)`      | nil                                                                                  |
+| `WithAttrFromContext(...func(context.Context) []slog.Attr)` | none                                                                                 |
+| `WithExtraFields(map[string]any)`                           | none — merged into every record (Erlang `extra_fields`, Java `appName`)              |
+| `WithFilter(func(context.Context, slog.Record) bool)`       | none — send-time predicate, **true means send** (Ruby `filter_sent_to_better_stack`) |
 
 **[amended]** Extra fields are merged into the **attribute tree**, at its root, not written as top-level payload keys. So with the default context key they appear inside `context`, and `WithContextKey("")` flattens them with everything else. Three consequences, all of which were the reason:
 
@@ -216,6 +216,31 @@ Taking a dependency instead was measured and rejected too. Dead-code elimination
 
 What is actually format-specific here is the framing, and it is a length prefix: a one-, three- or five-byte MessagePack array header. So the split is **the caller brings the codec, this package brings the framing**. `Marshaler` is `func(any) ([]byte, error)`, which is deliberately the signature the common libraries already expose, so most can be passed directly with no adapter; the handle-based ones need a three-line closure. Users tend to have a codec in the build already, and the ones who care about `str`-versus-`bin` or timestamp representation get to decide rather than inherit.
 
+**[amended] The JSON record encoder has two implementations, chosen by build tag: `encoding/json` everywhere, and `encoding/json/v2` from Go 1.27.** Both are `appendJSONObject(dst []byte, m map[string]any) ([]byte, error)`, which the two JSON `Encoder`s are written in terms of; the tag is `go1.27 && goexperiment.jsonv2`, naming the experiment as well as the release because json/v2 ships enabled-by-default in 1.27 but can still be turned off with `GOEXPERIMENT=nojsonv2`.
+
+The cost being addressed is the `map[string]any` waypoint. Every value in the payload is an interface, so `encoding/json` reflects over each one and boxes it again on the way out — 13 allocations and ~1.3 µs for the default record shape, which is the largest single line item in what a log call costs the calling goroutine. On one 1.27 toolchain, holding everything else equal:
+
+| record encoder                                    | `Handle` | `AppendRecord` | B/op |
+|---------------------------------------------------|----------|----------------|------|
+| `encoding/json`, pre-v2 engine (`nojsonv2`)        | 27 allocs | 14 allocs      | 608  |
+| `encoding/json`, v2 engine (1.27's default v1 API) | 25 allocs | 11 allocs      | —    |
+| `encoding/json/v2` directly (`json_v2.go`)         | **21 allocs** | **9 allocs** | 328  |
+
+So the tagged file is worth about four allocations per record over doing nothing on 1.27, and six over 1.26. It does not approach zero, and nothing in v2 will: reflection over `any` is the cost, and v2's gains are in struct-shaped encoding and in decoding. **A hand-written encoder does reach zero** — 0 allocations and ~250 ns, `Handle` at 16 — and that was implemented, measured and then set aside on the `json-hand-rolled` branch. What it costs is ~80 lines of format rules (string escaping, float formatting, RFC 3339 guards) that have to track `encoding/json`'s bytes forever, in a library whose pitch is auditability. The same judgement that rejected an in-module MessagePack codec above applies, and lands the same way: the speed is real, and it is not worth being the thing that has to be trusted. The branch remains as the measured record.
+
+**v2 is not a drop-in, and the two defaults it changes are the reason `json_contract_test.go` exists.** Both would have altered this library's behaviour on 1.27 only, silently:
+
+- **Invalid UTF-8 is an error in v2**, where v1 substitutes U+FFFD. A log message carries whatever bytes the application put in it; a stray byte must not be why the line never arrives. `jsontext.AllowInvalidUTF8(true)` restores substitution.
+- **`time.Duration` cannot be encoded at all in v2** — "no default representation" — where v1 writes the nanosecond count. slog's own durations never arrive as `Duration` values (`attr.go` renders them as strings), but a struct field, a nested map or a direct `Enqueue` can carry one. `FormatDurationAsNano(true)` restores it.
+
+`Deterministic` is deliberately *not* set: v1 sorts an object's keys and v2 does not, so key order differs between the two builds. JSON defines no order for object members, so payload key order is **unspecified** here — do not write a test that depends on it, and note that this is now observable as a difference between toolchains rather than only in principle.
+
+**Both halves of the tag are needed**, and each was verified. `goexperiment.jsonv2` because `encoding/json/v2`'s own files carry that constraint, so `GOEXPERIMENT=nojsonv2` removes the package and a bare `go1.27` tag breaks those builds. `go1.27` because the v2 API is version-stamped there and a build tag sets a file's language version — without it `go vet` fails with "requires go1.27 or later", and vet is not optional here (§0's 1.21 floor). That is also why the tag is not widened to `go1.26` to pick up 1.26 builds that opt into the experiment: `go1.26` vets on 1.26 and fails on 1.27, so those builds take `json_stdlib.go` — correct, merely not the fastest.
+
+**Graduation is the case no tag can express.** When json/v2 graduates the flag is deleted, and a tag naming an experiment that does not exist is silently false rather than an error — so `json_v2.go` would stop being compiled with nothing failing. The condition cannot be written in advance, because it needs the release number that ends the experiment, and guessing (`|| go1.28`) breaks `nojsonv2` builds outright if the experiment is still live there. `runtime.Version()` resolves it after the fact: it reports non-default experiments (`go1.27rc3-X:nojsonv2`), so an opt-out is distinguishable from a graduation at run time. `TestJSONImplementation` asserts on that and names the edit to make. Verified against a simulated graduation.
+
+`json_contract_test.go` is what keeps the two honest. It asserts behaviour, never bytes — invalid UTF-8 survives, a `Duration` encodes as nanoseconds, HTML is unescaped, `dt` is RFC 3339 nano, marshalers are honoured, an unencodable value errors and leaves the buffer holding exactly the records already in it — and it compiles under both tags, so it is the same test on both paths. Verified to have teeth: removing the options above makes it fail on 1.27 with exactly those two errors. The corollary is a testing obligation, recorded in CLAUDE.md — **the suite must be run on a pre-1.27 and a 1.27+ toolchain**, because either alone exercises one implementation and reports success for a library that ships both.
+
 Two consequences worth recording. `AppendRecord` checks that the marshaller returned a map (`0x80`–`0x8f`, `0xde`, `0xdf`), because `MsgPack(json.Marshal)` compiles and would otherwise be diagnosed only as a 406 on every batch. And `Frame` must **shift** the batch rather than return a re-sliced `batch[k:]` with a right-aligned header: `pack` calls it on a buffer it reuses, so a moved start creeps forward by the header width on every batch and grows without bound. The shift measures 285 ns against a 16 KiB batch, versus 67 µs for the gzip pass that immediately follows it.
 
 ### Record shape
@@ -262,12 +287,12 @@ Anyone who needs the shadowed value kept rather than discarded wants a strategy 
 
 Every response's status is classified — the single most important thing missing today, since the current code never reads `resp.StatusCode` and cannot distinguish a bad token from success.
 
-| Status | Action |
-| --- | --- |
-| `2xx` | done |
-| `413` | **split** the batch in half and resend both, recursively; a single record over the limit is dropped, counted `DroppedOversize`, and reported once naming `WithMaxBatchBytes` as the knob |
-| `401`, `402`, `403`, `406`, other `4xx` | **terminal** — drop the batch, report once. Retrying a bad token burns quota forever |
-| `429`, `5xx`, network/timeout | retry with backoff |
+| Status                                  | Action                                                                                                                                                                                   |
+|-----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `2xx`                                   | done                                                                                                                                                                                     |
+| `413`                                   | **split** the batch in half and resend both, recursively; a single record over the limit is dropped, counted `DroppedOversize`, and reported once naming `WithMaxBatchBytes` as the knob |
+| `401`, `402`, `403`, `406`, other `4xx` | **terminal** — drop the batch, report once. Retrying a bad token burns quota forever                                                                                                     |
+| `429`, `5xx`, network/timeout           | retry with backoff                                                                                                                                                                       |
 
 The docs name `403` for a bad token, but the live endpoint answers **`401`** with `{"error": "Unauthorized"}` — verified 2026-08-06 with both a missing and a bogus token, on HTTP/2 and HTTP/1.1. Classifying only the documented codes would leave the single most common misconfiguration in the retry path, so the rule is *terminal by default*: retry only the explicitly retryable set, drop everything else. Auth is also checked before the body is parsed (a bogus token with malformed JSON still returns 401), so `406` is only reachable once the token is valid.
 

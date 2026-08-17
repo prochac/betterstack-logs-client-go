@@ -142,6 +142,61 @@ func BenchmarkHandleParallel(b *testing.B) {
 	})
 }
 
+// discardSink is an enqueuer that does nothing at all, so a benchmark using it
+// measures the handler and only the handler.
+type discardSink struct{}
+
+func (discardSink) Enqueue(map[string]any) error { return nil }
+
+// BenchmarkHandleConvert measures the slog half alone: attribute tree plus
+// Converter, with no encode, no queue and no client behind it.
+//
+// It exists because BenchmarkHandle above cannot be read as the cost of a log
+// call. That one runs a whole client — sender goroutine, gzip, an in-process
+// HTTP server — on the same machine, and their CPU and GC land in its ns/op.
+// The pair brackets the truth: this is what the calling goroutine spends, and
+// BenchmarkHandle is what it spends when the delivery pipeline is competing
+// with it for a core.
+func BenchmarkHandleConvert(b *testing.B) {
+	logger := slog.New(newHandler(discardSink{}))
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		logger.Info("a log message", "index", i, "service", "api")
+	}
+}
+
+func BenchmarkHandleConvertWithAttrs(b *testing.B) {
+	logger := slog.New(newHandler(discardSink{})).
+		With("service", "api", "release", "v1.0.0").
+		With("region", "eu-central-1")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		logger.Info("a log message", "index", i)
+	}
+}
+
+// BenchmarkStdlibJSONHandler is the yardstick for the two above, and the only
+// benchmark here that measures none of this package's code.
+//
+// slog.JSONHandler writes a record straight into a buffer with no intermediate
+// representation, which is what lets it allocate nothing. This handler builds a
+// map[string]any because Converter and Encoder are public interfaces typed on
+// one (§4, "Duplicate keys"), so it cannot reach zero and is not trying to.
+// What the comparison is for is the gap's size and direction over time.
+func BenchmarkStdlibJSONHandler(b *testing.B) {
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		logger.Info("a log message", "index", i, "service", "api")
+	}
+}
+
 // BenchmarkEnqueue isolates the client half: encode plus channel send, with no
 // slog conversion.
 func BenchmarkEnqueue(b *testing.B) {

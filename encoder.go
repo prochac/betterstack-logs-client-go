@@ -1,13 +1,10 @@
 package betterstack
 
 import (
-	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
-	"sync"
 )
 
 // Encoder turns log records into the bytes of a request body.
@@ -65,18 +62,17 @@ func (ndjsonEncoder) ContentType() string { return "application/x-ndjson" }
 func (ndjsonEncoder) Frame(batch []byte, _ int) []byte { return batch }
 
 func (ndjsonEncoder) AppendRecord(dst []byte, v map[string]any) ([]byte, error) {
-	e := jsonEncoders.Get().(*pooledJSONEncoder)
-	defer jsonEncoders.Put(e)
-
-	e.buf.Reset()
-	if err := e.enc.Encode(v); err != nil {
-		// Encode may have written a partial value into the scratch buffer. dst
-		// is untouched because nothing is copied across until Encode succeeds.
-		return dst, err
+	n := len(dst)
+	dst, err := appendJSONObject(dst, v)
+	if err != nil {
+		// The record may have been written into the caller's buffer in part
+		// before the failure. Truncating to the original length discards that:
+		// what is beyond len is not part of the buffer's contents, and the
+		// records already accumulated in it are untouched.
+		return dst[:n], err
 	}
-	// json.Encoder.Encode terminates every value with a newline, which is
-	// exactly the NDJSON record separator. No separator handling of our own.
-	return append(dst, e.buf.Bytes()...), nil
+	// One newline is the whole of NDJSON's framing.
+	return append(dst, '\n'), nil
 }
 
 // JSONArray returns an encoder that sends a batch as one JSON array, as
@@ -114,22 +110,20 @@ func (jsonArrayEncoder) Frame(batch []byte, n int) []byte {
 }
 
 func (jsonArrayEncoder) AppendRecord(dst []byte, v map[string]any) ([]byte, error) {
-	e := jsonEncoders.Get().(*pooledJSONEncoder)
-	defer jsonEncoders.Put(e)
-
-	e.buf.Reset()
-	if err := e.enc.Encode(v); err != nil {
-		return dst, err
-	}
-	// Encode's trailing newline is the one byte that is wrong for an array. It
-	// is dropped rather than kept as whitespace so that a record's encoded size,
-	// which is what the batch byte cap is measured against, is exactly its
-	// contribution to the body.
-	b := e.buf.Bytes()
-	b = b[:len(b)-1]
-
+	n := len(dst)
+	// The leading comma, which Frame overwrites for the first record of a
+	// batch. Nothing else separates records, so a record's encoded size is
+	// exactly its contribution to the body, which is what the batch byte cap is
+	// measured against.
 	dst = append(dst, ',')
-	return append(dst, b...), nil
+
+	dst, err := appendJSONObject(dst, v)
+	if err != nil {
+		// See ndjsonEncoder.AppendRecord: truncation is what leaves the records
+		// already accumulated in dst intact.
+		return dst[:n], err
+	}
+	return dst, nil
 }
 
 // Marshaler encodes one log record as a self-contained MessagePack map.
@@ -272,22 +266,13 @@ func checkMsgPackMap(b []byte) error {
 		"MsgPack needs a MessagePack codec", b[0])
 }
 
-type pooledJSONEncoder struct {
-	buf *bytes.Buffer
-	enc *json.Encoder
-}
-
-// jsonEncoders pools the scratch buffer and the *json.Encoder together. The
-// encoder is stateful only in its escaping and indentation settings, so it can
-// be reused for the life of the process once configured.
-var jsonEncoders = sync.Pool{
-	New: func() any {
-		buf := &bytes.Buffer{}
-		enc := json.NewEncoder(buf)
-		// Without this, every URL, every "a < b", and every "&" in a log
-		// message is mangled into < / & on the way to a JSON payload
-		// that is never embedded in HTML.
-		enc.SetEscapeHTML(false)
-		return &pooledJSONEncoder{buf: buf, enc: enc}
-	},
-}
+// appendJSONObject appends the JSON encoding of one record to dst, with no
+// trailing newline, and is what both JSON encoders above are written in terms
+// of. It has two implementations, selected by build tag:
+//
+//   - json_stdlib.go, on every toolchain, using encoding/json;
+//   - json_v2.go, from Go 1.27, using encoding/json/v2 directly.
+//
+// json_v2.go states what it costs to keep the two agreeing. Neither writes a
+// trailing newline: NDJSON's separator is added by the caller above, because
+// the array encoder must not have one.

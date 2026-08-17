@@ -99,39 +99,39 @@ dropped.
 
 ## Client options
 
-| Option | Default | Notes |
-| --- | --- | --- |
-| `WithEndpoint(string)` | `https://in.logs.betterstack.com` | the ingesting host |
-| `WithBatchSize(int)` | `1000` | records per batch |
-| `WithBatchInterval(time.Duration)` | `1s` | how long a partial batch waits; the timer starts on the batch's first record, so an idle client does no work |
-| `WithMaxBatchBytes(int)` | `5 MiB` | uncompressed assembly cap, not the API's limit |
-| `WithMaxQueueSize(int)` | `100000` | records; the queue is where backpressure is shed |
-| `WithBurstProtection(int, time.Duration)` | disabled | at most *n* records per window, refused before encoding; the JavaScript client's `10000` per `5s` is a reasonable starting point |
-| `WithMaxRetries(int)` | `5` | retries **after** the first attempt, so at most 6 requests; `0` means send once |
-| `WithRetryBackoff(time.Duration)` | `300ms` | base delay, exponential with full jitter |
-| `WithRetryCeiling(time.Duration)` | `60s` | total time one batch may spend across all attempts |
-| `WithMaxInFlight(int)` | `5` | concurrent uploads |
-| `WithTimeout(time.Duration)` | `10s` | per request attempt |
-| `WithConnectTimeout(time.Duration)` | `5s` | TCP connect; no effect with `WithHTTPClient` |
-| `WithShutdownTimeout(time.Duration)` | `15s` | how long `Close` waits |
-| `WithCompression(Compression)` | `CompressionGzip` | `CompressionNone` to disable |
-| `WithEncoder(Encoder)` | `NDJSON()` | `JSONArray()` and `MsgPack(marshal)` also provided |
-| `WithOnError(func(error))` | one line per event to stderr | must not log through this handler |
-| `WithDryRun(bool)` | `false` | run everything except the request |
-| `WithHTTPClient(*http.Client)` | tuned internal client | escape hatch; the client is not owned or closed |
+| Option                                    | Default                           | Notes                                                                                                                            |
+|-------------------------------------------|-----------------------------------|----------------------------------------------------------------------------------------------------------------------------------|
+| `WithEndpoint(string)`                    | `https://in.logs.betterstack.com` | the ingesting host                                                                                                               |
+| `WithBatchSize(int)`                      | `1000`                            | records per batch                                                                                                                |
+| `WithBatchInterval(time.Duration)`        | `1s`                              | how long a partial batch waits; the timer starts on the batch's first record, so an idle client does no work                     |
+| `WithMaxBatchBytes(int)`                  | `5 MiB`                           | uncompressed assembly cap, not the API's limit                                                                                   |
+| `WithMaxQueueSize(int)`                   | `100000`                          | records; the queue is where backpressure is shed                                                                                 |
+| `WithBurstProtection(int, time.Duration)` | disabled                          | at most *n* records per window, refused before encoding; the JavaScript client's `10000` per `5s` is a reasonable starting point |
+| `WithMaxRetries(int)`                     | `5`                               | retries **after** the first attempt, so at most 6 requests; `0` means send once                                                  |
+| `WithRetryBackoff(time.Duration)`         | `300ms`                           | base delay, exponential with full jitter                                                                                         |
+| `WithRetryCeiling(time.Duration)`         | `60s`                             | total time one batch may spend across all attempts                                                                               |
+| `WithMaxInFlight(int)`                    | `5`                               | concurrent uploads                                                                                                               |
+| `WithTimeout(time.Duration)`              | `10s`                             | per request attempt                                                                                                              |
+| `WithConnectTimeout(time.Duration)`       | `5s`                              | TCP connect; no effect with `WithHTTPClient`                                                                                     |
+| `WithShutdownTimeout(time.Duration)`      | `15s`                             | how long `Close` waits                                                                                                           |
+| `WithCompression(Compression)`            | `CompressionGzip`                 | `CompressionNone` to disable                                                                                                     |
+| `WithEncoder(Encoder)`                    | `NDJSON()`                        | `JSONArray()` and `MsgPack(marshal)` also provided                                                                               |
+| `WithOnError(func(error))`                | one line per event to stderr      | must not log through this handler                                                                                                |
+| `WithDryRun(bool)`                        | `false`                           | run everything except the request                                                                                                |
+| `WithHTTPClient(*http.Client)`            | tuned internal client             | escape hatch; the client is not owned or closed                                                                                  |
 
 ## Handler options
 
-| Option | Default | Notes |
-| --- | --- | --- |
-| `WithLevel(slog.Leveler)` | `slog.LevelInfo` | pass a `*slog.LevelVar` to change it at runtime |
-| `WithAddSource(bool)` | `false` | adds `source` with function, file and line |
-| `WithReplaceAttr(func([]string, slog.Attr) slog.Attr)` | none | `slog.HandlerOptions.ReplaceAttr` semantics; does not apply to the reserved keys |
-| `WithAttrFromContext(...func(context.Context) []slog.Attr)` | none | trace and request IDs; placed at the root, outside open groups |
-| `WithExtraFields(map[string]any)` | none | merged into every record |
-| `WithFilter(func(context.Context, slog.Record) bool)` | none | return **true to send** |
-| `WithConverter(Converter)` | `DefaultConverter` | the supported way to change the record shape |
-| `WithContextKey(string)` | `"context"` | `""` flattens attributes to the top level |
+| Option                                                      | Default            | Notes                                                                            |
+|-------------------------------------------------------------|--------------------|----------------------------------------------------------------------------------|
+| `WithLevel(slog.Leveler)`                                   | `slog.LevelInfo`   | pass a `*slog.LevelVar` to change it at runtime                                  |
+| `WithAddSource(bool)`                                       | `false`            | adds `source` with function, file and line                                       |
+| `WithReplaceAttr(func([]string, slog.Attr) slog.Attr)`      | none               | `slog.HandlerOptions.ReplaceAttr` semantics; does not apply to the reserved keys |
+| `WithAttrFromContext(...func(context.Context) []slog.Attr)` | none               | trace and request IDs; placed at the root, outside open groups                   |
+| `WithExtraFields(map[string]any)`                           | none               | merged into every record                                                         |
+| `WithFilter(func(context.Context, slog.Record) bool)`       | none               | return **true to send**                                                          |
+| `WithConverter(Converter)`                                  | `DefaultConverter` | the supported way to change the record shape                                     |
+| `WithContextKey(string)`                                    | `"context"`        | `""` flattens attributes to the top level                                        |
 
 The default level is `Info`, not `Debug`: shipping debug records to a metered
 endpoint unless you opt out is a billing surprise.

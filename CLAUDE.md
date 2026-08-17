@@ -24,6 +24,8 @@ Sections of DESIGN.md marked **[amended]** were corrected during implementation,
 
 **MessagePack** has landed as `MsgPack(marshal Marshaler)` — and not in the shape DESIGN §4 originally specified, so read that section's amendment before touching it. It **bundles no codec**: `Marshaler` is `func(any) ([]byte, error)`, deliberately the signature the common libraries already expose, so most can be passed directly. Writing one in-module was rejected (the `slog.KindAny` hole means the type set is not bounded, and a hand-rolled serialiser costs more trust than zero dependencies buys), and so was depending on one — dead-code elimination does *not* strip an unused codec, so `ugorji/go/codec` would cost every user +8.73 MB of stripped binary whether or not they selected the format. What this package owns is the array framing, which is a length prefix. Do not add a bundled default codec.
 
+**The JSON record encode is build-tagged.** `appendJSONObject` is `encoding/json` on every toolchain and `encoding/json/v2` from Go 1.27, which is worth ~4 allocations per record over 1.27's own v1 API and 6 over 1.26 — 27 allocations per `Handle` becomes 21. A **hand-written** reflection-free encoder was built first and reaches 0 allocations for the encode and 16 per `Handle`; it was set aside, with its differential fuzzing, on the **`json-hand-rolled` branch**, because ~80 lines of format rules tracking `encoding/json`'s bytes is not a liability this library should carry. Do not re-add it without reading DESIGN §4 and that branch's commit message. Do not remove `json_v2.go`'s `jsonOptions`.
+
 Two items left v0.3 rather than being implemented, both recorded in DESIGN §10: benchmarks were listed there but shipped with v0.1, and **mirroring to a second `slog.Handler` is struck** — `slog.MultiHandler` (Go 1.26) and `samber/slog-multi` already do it, and reimplementing it inside the handler would duplicate the `log/slog` contract surface for no new capability. Do not add a `WithMirror`; README's "Logging to more than one place" is the answer.
 
 ## Commands
@@ -40,6 +42,21 @@ go test -run '^$' -bench . -benchmem -benchtime 2s ./...
 go test -race -run TestSlogtest ./...   # handler conformance alone
 ```
 
+**The suite must be run on two toolchains, and neither alone is sufficient.** The JSON record encoder is build-tagged (`json_stdlib.go` / `json_v2.go`), so one toolchain exercises one implementation and reports success for a library that ships both. There are four reachable configurations:
+
+```sh
+go test -race ./...                               # < 1.27: json_stdlib.go
+GOEXPERIMENT=jsonv2 go test -race ./...           # 1.25/1.26, experiment on: json_stdlib.go still
+go1.27rc3 test -race ./...                        # >= 1.27: json_v2.go
+GOEXPERIMENT=nojsonv2 go1.27rc3 test -race ./...  # 1.27, experiment off: json_stdlib.go again
+```
+
+**The second row is the one that goes missing**, and it did: the two tags must be exact complements, and while `json_stdlib.go` read `!(go1.26 && goexperiment.jsonv2)` against `json_v2.go`'s `go1.27 &&`, that build compiled *neither* file and failed with `undefined: appendJSONObject`. Nothing caught it, because the matrix here did not list it. It selects `json_stdlib.go` by design: `encoding/json/v2` is importable from Go 1.25, but an experiment is outside the API promise, so it is stamped in `api/go1.27.txt` and in no earlier one — a `go1.25` or `go1.26` tag therefore compiles everywhere and then fails `go vet`'s `stdversion` on 1.27 with *"requires go1.27 or later (file is go1.25)"*. `TestJSONImplementation` rejects the widened tag outright.
+
+`json_contract_test.go` is what makes this worth doing: it is untagged, so it is the same test on both paths, and it asserts the behaviours v2 changes by default. It has been verified to fail when `json_v2.go`'s options are removed.
+
+**On a new Go release, the check is `TestJSONImplementation`.** When json/v2 graduates, `goexperiment.jsonv2` is deleted, the tag silently stops matching — an unknown build tag is false, not an error — and `json_v2.go` quietly stops being compiled. That condition cannot be written in advance, since it needs the release that ends the experiment, so the test fails on it instead: `runtime.Version()` reports non-default experiments (`go1.27rc3-X:nojsonv2`), which is what distinguishes an opt-out from a graduation. The fix is then a plain `//go:build go1.NN`.
+
 **`go vet` is not optional.** `go.mod` declares `go 1.21` and the local toolchain is much newer. The compiler will happily build a post-1.21 stdlib symbol; only `go vet`'s `stdversion` analyzer catches it. Verified: `slices.Concat` compiles and passes tests, and `go vet` reports `requires go1.22 or later (module is go1.21)`.
 
 ## Architecture
@@ -52,7 +69,9 @@ One package, standard library only. Two dependencies, both test-only and neither
 - **`handler.go`** — `Handler`, `HandlerOption`s, and the `slog.Handler` implementation. Depends on the unexported `enqueuer` interface, not on `*Client` directly, so the handler is testable with no network stack.
 - **`attr.go`** — the attribute half of the `log/slog` contract: `groupOrAttrs` accumulation, the recursive `appendAttr`, group materialisation, source resolution, context extraction.
 - **`converter.go`** — `Converter`, `DefaultConverter`, the reserved payload keys, the record shape.
-- **`encoder.go`** — the `Encoder` interface and the NDJSON and JSON-array implementations, over one shared pool of `*json.Encoder`s; plus `Marshaler` and `MsgPack`, which have no pool because the caller's codec owns its own scratch.
+- **`encoder.go`** — the `Encoder` interface and the NDJSON and JSON-array implementations, plus `Marshaler` and `MsgPack`, which needs no scratch because the caller's codec owns its own. Both JSON encoders are written in terms of `appendJSONObject`, which has two build-tagged implementations.
+- **`json_stdlib.go`** (`!(go1.27 && goexperiment.jsonv2)`) — `appendJSONObject` over a pool of `*json.Encoder`s. The implementation everywhere before Go 1.27.
+- **`json_v2.go`** (`go1.27 && goexperiment.jsonv2`) — `appendJSONObject` over `encoding/json/v2`, writing into the caller's buffer through `client.go`'s `sliceWriter`. Worth ~4 allocations a record over 1.27's v1 API and 6 over 1.26. It **must** carry `jsonOptions`: v2 rejects invalid UTF-8 outright and refuses `time.Duration` entirely, both of which would change this library's behaviour on 1.27 alone. See DESIGN §4.
 - **`limiter.go`** — `WithBurstProtection`'s token bucket, held as a single monotone timestamp in one `atomic.Int64`. Unexported in full. Its `now` field is a clock seam, and it exists so the tests are deterministic rather than timed.
 - **`errors.go`**, **`version.go`**, **`doc.go`** — error types and the `OnError` funnel; `User-Agent` from build info; the package doc.
 
