@@ -47,23 +47,56 @@ type Encoder interface {
 	Frame(batch []byte, n int) []byte
 }
 
+// ObjectAppender writes the JSON encoding of one record to dst, appending in
+// the manner of the append builtin and adding no trailing newline. It is the
+// seam the two JSON encoders are built on, so that the object encoding can be
+// replaced without reimplementing the framing around it.
+//
+// The default is encoding/json, which is the right choice for almost everyone.
+// The reason the seam is exported is that encoding/json cannot walk a
+// map[string]any cheaply — every value is an interface, so it reflects over
+// each one and boxes it again on the way out — and no general-purpose JSON
+// library does meaningfully better on that shape, because they win by caching
+// reflection over concrete struct types. Beating it takes an appender written
+// for this payload specifically, which is what the fastjson subpackage is:
+//
+//	betterstack.WithEncoder(betterstack.NDJSONWith(fastjson.AppendObject))
+//
+// An ObjectAppender must be safe for concurrent use: one Encoder is shared by
+// every goroutine calling Enqueue. On error it may leave dst extended — the
+// callers below truncate, so what matters is that the records already
+// accumulated in the buffer survive, not that the bytes past its length are
+// untouched.
+type ObjectAppender func(dst []byte, m map[string]any) ([]byte, error)
+
 // NDJSON returns the default encoder: newline-delimited JSON, one record per
-// line, sent as application/x-ndjson.
+// line, sent as application/x-ndjson, with records encoded by encoding/json.
 //
 // NDJSON is the default because a batch is then simply the concatenation of its
 // records — assembly is one append, with no array framing, no separator
 // bookkeeping, and no second pass over the batch.
-func NDJSON() Encoder { return ndjsonEncoder{} }
+func NDJSON() Encoder { return NDJSONWith(appendJSONObject) }
 
-type ndjsonEncoder struct{}
+// NDJSONWith is NDJSON with the record encoding supplied by the caller. See
+// ObjectAppender. It panics if appendObject is nil, since an encoder that
+// cannot encode has no useful behaviour to fall back on and failing at
+// construction beats failing per record.
+func NDJSONWith(appendObject ObjectAppender) Encoder {
+	if appendObject == nil {
+		panic("betterstack: NDJSONWith requires a non-nil ObjectAppender")
+	}
+	return ndjsonEncoder{appendObject: appendObject}
+}
+
+type ndjsonEncoder struct{ appendObject ObjectAppender }
 
 func (ndjsonEncoder) ContentType() string { return "application/x-ndjson" }
 
 func (ndjsonEncoder) Frame(batch []byte, _ int) []byte { return batch }
 
-func (ndjsonEncoder) AppendRecord(dst []byte, v map[string]any) ([]byte, error) {
+func (e ndjsonEncoder) AppendRecord(dst []byte, v map[string]any) ([]byte, error) {
 	n := len(dst)
-	dst, err := appendJSONObject(dst, v)
+	dst, err := e.appendObject(dst, v)
 	if err != nil {
 		// The record may have been written into the caller's buffer in part
 		// before the failure. Truncating to the original length discards that:
@@ -92,9 +125,19 @@ func (ndjsonEncoder) AppendRecord(dst []byte, v map[string]any) ([]byte, error) 
 // That is one byte written and one appended, whatever the batch size, and it
 // holds for any contiguous run of records — which is what lets an oversized
 // batch be split and each half re-framed without re-encoding anything.
-func JSONArray() Encoder { return jsonArrayEncoder{} }
+func JSONArray() Encoder { return JSONArrayWith(appendJSONObject) }
 
-type jsonArrayEncoder struct{}
+// JSONArrayWith is JSONArray with the record encoding supplied by the caller.
+// See ObjectAppender. It panics if appendObject is nil, for the reason
+// NDJSONWith does.
+func JSONArrayWith(appendObject ObjectAppender) Encoder {
+	if appendObject == nil {
+		panic("betterstack: JSONArrayWith requires a non-nil ObjectAppender")
+	}
+	return jsonArrayEncoder{appendObject: appendObject}
+}
+
+type jsonArrayEncoder struct{ appendObject ObjectAppender }
 
 func (jsonArrayEncoder) ContentType() string { return "application/json" }
 
@@ -109,7 +152,7 @@ func (jsonArrayEncoder) Frame(batch []byte, n int) []byte {
 	return append(batch, ']')
 }
 
-func (jsonArrayEncoder) AppendRecord(dst []byte, v map[string]any) ([]byte, error) {
+func (e jsonArrayEncoder) AppendRecord(dst []byte, v map[string]any) ([]byte, error) {
 	n := len(dst)
 	// The leading comma, which Frame overwrites for the first record of a
 	// batch. Nothing else separates records, so a record's encoded size is
@@ -117,7 +160,7 @@ func (jsonArrayEncoder) AppendRecord(dst []byte, v map[string]any) ([]byte, erro
 	// measured against.
 	dst = append(dst, ',')
 
-	dst, err := appendJSONObject(dst, v)
+	dst, err := e.appendObject(dst, v)
 	if err != nil {
 		// See ndjsonEncoder.AppendRecord: truncation is what leaves the records
 		// already accumulated in dst intact.
@@ -266,13 +309,16 @@ func checkMsgPackMap(b []byte) error {
 		"MsgPack needs a MessagePack codec", b[0])
 }
 
-// appendJSONObject appends the JSON encoding of one record to dst, with no
-// trailing newline, and is what both JSON encoders above are written in terms
-// of. It has two implementations, selected by build tag:
+// appendJSONObject is the default ObjectAppender, used by NDJSON and JSONArray.
+// It has two implementations, selected by build tag:
 //
 //   - json_stdlib.go, on every toolchain, using encoding/json;
 //   - json_v2.go, from Go 1.27, using encoding/json/v2 directly.
 //
-// json_v2.go states what it costs to keep the two agreeing. Neither writes a
-// trailing newline: NDJSON's separator is added by the caller above, because
-// the array encoder must not have one.
+// json_v2.go states what it costs to keep the two agreeing. The two tags must
+// stay exact complements of one another, or a toolchain falls through the gap
+// and the package does not build — which is what happened to Go 1.26 with
+// GOEXPERIMENT=jsonv2.
+//
+// Neither writes a trailing newline: NDJSON's separator is added by the caller
+// above, because the array encoder must not have one.

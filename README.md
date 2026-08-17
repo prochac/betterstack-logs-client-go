@@ -126,7 +126,7 @@ minute. Raise `WithRetryCeiling` if you would rather wait it out.
 | `WithConnectTimeout(time.Duration)`       | `5s`                              | TCP connect; no effect with `WithHTTPClient`                                                                                     |
 | `WithShutdownTimeout(time.Duration)`      | `15s`                             | how long `Close` waits                                                                                                           |
 | `WithCompression(Compression)`            | `CompressionGzip`                 | `CompressionNone` to disable                                                                                                     |
-| `WithEncoder(Encoder)`                    | `NDJSON()`                        | `JSONArray()` and `MsgPack(marshal)` also provided                                                                               |
+| `WithEncoder(Encoder)`                    | `NDJSON()`                        | also `JSONArray()`, `MsgPack(marshal)`, and `NDJSONWith`/`JSONArrayWith` for a custom `ObjectAppender`                            |
 | `WithOnError(func(error))`                | one line per event to stderr      | must not log through this handler                                                                                                |
 | `WithDryRun(bool)`                        | `false`                           | run everything except the request                                                                                                |
 | `WithHTTPClient(*http.Client)`            | tuned internal client             | escape hatch; the client is not owned or closed                                                                                  |
@@ -182,6 +182,39 @@ simply the concatenation of its records, with no framing pass at all.
 
 Gzip is on by default because the API's 10 MiB request limit is measured on
 *compressed* bytes, so it multiplies how much fits in a request.
+
+### Faster JSON, if you log a lot
+
+Records are encoded by `encoding/json`, on the goroutine that called the logger.
+That is the right default, but it is not cheap: a payload is a `map[string]any`,
+so every value is an interface the encoder has to reflect over and box again on
+the way out.
+
+The `fastjson` subpackage is a reflection-free appender for exactly this payload
+shape. Opt in at the call site:
+
+```go
+import "github.com/prochac/logs-client-go/fastjson"
+
+betterstack.WithEncoder(betterstack.NDJSONWith(fastjson.AppendObject))
+```
+
+Measured on Go 1.27 with the default record shape, encoding a record goes from
+1617 ns and 9 allocations to **263 ns and none**, which takes a whole
+`logger.Info` call from 3525 ns and 21 allocations to 2295 ns and 16.
+
+It is a separate package on purpose. It is a second implementation of a format
+the standard library already implements, and it is not something you should have
+to trust because you imported the client — so a binary that does not import it
+does not contain it. Read [its documentation](https://pkg.go.dev/github.com/prochac/logs-client-go/fastjson)
+before adopting it; the one visible difference is that object keys are not
+sorted.
+
+Anything else that satisfies `ObjectAppender` works too, but note that a general
+-purpose JSON library is unlikely to help: they win by caching reflection over
+concrete struct types, and a `map[string]any` gives them nothing to cache.
+`goccy/go-json` is about 20% faster than `encoding/json` here and
+`json-iterator` is slower.
 
 ### MessagePack
 

@@ -79,7 +79,7 @@ Separate `ClientOption` and `HandlerOption` types so the compiler enforces which
 | `WithConnectTimeout(time.Duration)`       | `5s`                              | Java                                                                                 |
 | `WithHTTPClient(*http.Client)`            | tuned internal client             | escape hatch; disables the two timeout options                                       |
 | `WithCompression(Compression)`            | `CompressionGzip`                 | `CompressionNone` to disable                                                         |
-| `WithEncoder(Encoder)`                    | `NDJSON`                          | §4 — also `JSONArray`, `MsgPack(Marshaler)`                                          |
+| `WithEncoder(Encoder)`                    | `NDJSON`                          | §4 — also `JSONArray`, `MsgPack(Marshaler)`, `NDJSONWith`/`JSONArrayWith`             |
 | `WithOnError(func(error))`                | write to `os.Stderr`              | PARITY §5                                                                            |
 | `WithShutdownTimeout(time.Duration)`      | `15s`                             | used by `Close`                                                                      |
 | `WithDryRun(bool)`                        | `false`                           | JS `sendLogsToBetterStack` kill switch                                               |
@@ -230,7 +230,37 @@ The cost being addressed is the `map[string]any` waypoint. Every value in the pa
 | `encoding/json`, v2 engine (1.27's default v1 API) | 25 allocs | 11 allocs      | —    |
 | `encoding/json/v2` directly (`json_v2.go`)         | **21 allocs** | **9 allocs** | 328  |
 
-So the tagged file is worth about four allocations per record over doing nothing on 1.27, and six over 1.26. It does not approach zero, and nothing in v2 will: reflection over `any` is the cost, and v2's gains are in struct-shaped encoding and in decoding. **A hand-written encoder does reach zero** — 0 allocations and ~250 ns, `Handle` at 16 — and that was implemented, measured and then set aside on the `json-hand-rolled` branch. What it costs is ~80 lines of format rules (string escaping, float formatting, RFC 3339 guards) that have to track `encoding/json`'s bytes forever, in a library whose pitch is auditability. The same judgement that rejected an in-module MessagePack codec above applies, and lands the same way: the speed is real, and it is not worth being the thing that has to be trusted. The branch remains as the measured record.
+So the tagged file is worth about four allocations per record over doing nothing on 1.27, and six over 1.26. It does not approach zero, and nothing in v2 will: reflection over `any` is the cost, and v2's gains are in struct-shaped encoding and in decoding. **A hand-written encoder does reach zero** — 0 allocations and ~250 ns, `Handle` at 16 — and that was implemented, measured and then set aside on the `json-hand-rolled` branch. What it costs is ~80 lines of format rules (string escaping, float formatting, RFC 3339 guards) that have to track `encoding/json`'s bytes forever, in a library whose pitch is auditability. The same judgement that rejected an in-module MessagePack codec above applies, and lands the same way: the speed is real, and it is not worth being the thing that has to be trusted.
+
+**[amended] That judgement was right about the code and wrong about where it had to live.** The choice was framed as ship-it-or-not, in the main package, where every user inherits it. There is a third placement, and it is the one `MsgPack` already argues for: **the object encoding is a seam, and the fast implementation is a subpackage nobody links unless they import it.**
+
+```go
+type ObjectAppender func(dst []byte, m map[string]any) ([]byte, error)
+
+func NDJSONWith(appendObject ObjectAppender) Encoder
+func JSONArrayWith(appendObject ObjectAppender) Encoder
+```
+
+`NDJSON()` and `JSONArray()` are those two applied to `appendJSONObject`, so nothing at any existing call site changes. `fastjson.AppendObject` is the hand-rolled appender, moved from the branch into `fastjson/` with its differential fuzzing.
+
+Three things make this different from shipping it in the main package, and all three were verified rather than assumed:
+
+- **Nobody trusts it who has not imported it.** `go list -deps ./example` does not mention `fastjson`, and `go tool nm` finds zero of its symbols in the built binary. This is exactly the property the `ugorji/go/codec` measurement above showed a *dependency* cannot have: that cost came from `init()`-time registration in a package that was imported, and does not apply to a subpackage of this module that the main package never imports.
+- **The opt-in is visible.** It is an import and a call-site argument, which show up in review and in `go.mod`-adjacent tooling.
+- **The default path pays an indirect call, and it is small enough to be invisible where it matters.** Measured by interleaving before and after in one run, six alternations of three samples each, so drift and background load hit both equally — which mattered: a naive back-to-back run reported a spurious +19% on `Enqueue` that the interleaved run shows at p=0.98. What survives is `NDJSONAppendRecord` +4.7% (p=0.004) and `BatchAssembly` +3.7% (p=0.002) — the two benchmarks that do nothing but call `AppendRecord` in a tight loop — against `Enqueue`, `Handle` and every allocation count flat. The cost is real in the microbenchmark of the encode alone and not resolvable in the operation a user actually performs, where the encode is a third of the work. Recovering it would mean a second encoder type per format so the default keeps a direct call, which duplicates the buffer-truncation invariant across four methods; that trade was declined.
+
+Measured on one binary, so there is no cross-build bias — Go 1.27, v2 engine, default record shape:
+
+| | `AppendRecord` | `Handle` |
+|---|---|---|
+| `encoding/json` (default) | 1617 ns, 9 allocs | 3525 ns, 21 allocs |
+| `fastjson.AppendObject` | **263 ns, 0 allocs** | **2295 ns, 16 allocs** |
+
+**A build tag was considered for this and is worse on every axis.** `-tags` is a global flag on the *application* build, not a choice a consumer can make per logger; it is invisible at the call site; it would silently change the bytes on the wire (see key order below); and it would take the tag matrix from three configurations to six, doubling the obligation the next paragraph already describes as the price of two implementations.
+
+**A `Marshaler`-shaped seam was considered and does not work here**, which is why `ObjectAppender` is append-shaped rather than mirroring `MsgPack`'s `func(any) ([]byte, error)`. Measured on the default record shape (Go 1.27): `goccy/go-json` 879 ns / 4 allocs and `json-iterator` 1665 ns / 21 allocs, against `encoding/json`'s 1104 ns / 10 — that is, the fastest general-purpose library buys 20% and the best-known one is *slower* than the standard library. They win by caching reflection over concrete struct types, and a `map[string]any` defeats that entirely; the seam's mandatory `[]byte` return adds an allocation on top. `MsgPack` can delegate to the ecosystem because the alternative there is no codec at all. For JSON the standard library is already in the box, and beating it takes an appender written for this payload — so the seam must at least be capable of zero allocations, which only the append shape is.
+
+**What `fastjson` costs, and what it does not.** It is still ~80 lines of format rules tracking `encoding/json`'s bytes, and that burden is live rather than theoretical: Go 1.27 changed one of those rules, writing U+FFFD literally where the pre-1.27 engine wrote the six-character `\ufffd` escape. The fuzzing absorbs it by comparing decoded values for invalid UTF-8 and bytes everywhere else. What the placement buys is that this is now a cost borne by the people who chose it. Its fallback deliberately uses the `encoding/json` **v1 API**, whose behaviour Go's compatibility promise pins, so the subpackage needs no build tag and no options of its own.
 
 **v2 is not a drop-in, and the two defaults it changes are the reason `json_contract_test.go` exists.** Both would have altered this library's behaviour on 1.27 only, silently:
 
