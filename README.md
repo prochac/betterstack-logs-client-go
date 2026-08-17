@@ -147,6 +147,16 @@ minute. Raise `WithRetryCeiling` if you would rather wait it out.
 The default level is `Info`, not `Debug`: shipping debug records to a metered
 endpoint unless you opt out is a billing surprise.
 
+One difference worth knowing if you are porting a `ReplaceAttr` function from
+`slog.TextHandler` or `slog.JSONHandler`: theirs is called for the built-in
+`time`, `level`, `msg` and `source` fields as well as for attributes, and this
+one is not called for `dt`, `level` or `message`. Those three are the ingestion
+API's own fields rather than attributes, and rewriting them produces a payload
+the server cannot read. A redaction function that rewrites `msg` will therefore
+be silently skipped for the message — use `WithConverter` to change the record
+shape, and note that `source`, which is an attribute here, still goes through
+`ReplaceAttr` as usual.
+
 ## Record shape
 
 ```json
