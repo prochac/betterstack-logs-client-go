@@ -189,7 +189,11 @@ NDJSON (`application/x-ndjson`) by default, gzip-compressed. A batch is then
 simply the concatenation of its records, with no framing pass at all.
 
 `WithEncoder(betterstack.JSONArray())` sends `application/json` instead, and
-`Encoder` is a three-method interface if you need another format.
+`Encoder` is a three-method interface if you need another format. A format whose
+batch really is just its records — any other line-delimited one — should also
+implement `IdentityFramer`, one method returning `true`, which tells the client
+there is nothing to frame and saves it a copy of every batch and the buffer it
+would have copied into.
 
 Gzip is on by default because the API's 10 MiB request limit is measured on
 *compressed* bytes, so it multiplies how much fits in a request.

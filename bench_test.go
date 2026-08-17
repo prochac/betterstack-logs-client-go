@@ -347,6 +347,58 @@ func BenchmarkCompress(b *testing.B) {
 	}
 }
 
+// BenchmarkPack measures what an IdentityFramer saves: the copy of the whole
+// batch into the framing buffer, which an encoder whose Frame writes nothing
+// does not need. The framed variants force the general path on the same encoder
+// and the same bytes, so the pair differs by exactly that copy.
+//
+// The gzip numbers are the honest ones to read first — the copy is a few percent
+// of the compression pass that follows it, which is why this was a note in
+// REVIEW §7 for a long time. What the fast path is really worth is the buffer
+// itself: it is never allocated, so the default configuration holds one
+// MaxBatchBytes-sized buffer fewer for the life of the client.
+func BenchmarkPack(b *testing.B) {
+	enc := NDJSON()
+	var raw []byte
+	var bounds []int
+	for i := 0; i < 1000; i++ {
+		var err error
+		raw, err = enc.AppendRecord(raw, map[string]any{
+			KeyMessage: fmt.Sprintf("request %d completed", i),
+			KeyLevel:   "INFO",
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+		bounds = append(bounds, len(raw))
+	}
+
+	for _, tc := range []struct {
+		name     string
+		comp     Compression
+		identity bool
+	}{
+		{"gzip/identity", CompressionGzip, true},
+		{"gzip/framed", CompressionGzip, false},
+		{"none/identity", CompressionNone, true},
+		{"none/framed", CompressionNone, false},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			p := newPacker(enc, tc.comp)
+			p.identity = tc.identity
+
+			b.SetBytes(int64(len(raw)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := p.pack(raw, bounds); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkFlush measures the round trip a caller pays for at shutdown.
 func BenchmarkFlush(b *testing.B) {
 	c := benchClient(b, WithBatchSize(1000))

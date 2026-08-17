@@ -82,7 +82,7 @@ type worker struct {
 
 func (w *worker) packer() *packer {
 	if w.pk == nil {
-		w.pk = newPacker(w.c.cfg.compression)
+		w.pk = newPacker(w.c.cfg.encoder, w.c.cfg.compression)
 	}
 	return w.pk
 }
@@ -217,7 +217,7 @@ func (w *worker) uploadBy(ctx context.Context, b *batch, deadline time.Time) err
 // dispatch blocks when every worker is busy, and this worker, being one of the
 // busy ones, would be waiting on itself.
 func (w *worker) splitAndSend(ctx context.Context, b *batch, deadline time.Time) error {
-	left, right, err := w.packer().split(w.c.cfg.encoder, b)
+	left, right, err := w.packer().split(b)
 	if err != nil {
 		w.c.stats.droppedRejected.Add(uint64(b.records))
 		err = fmt.Errorf("betterstack: splitting %d record(s) after a 413: %w", b.records, err)

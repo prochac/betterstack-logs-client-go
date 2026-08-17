@@ -216,6 +216,14 @@ func WithBatchInterval(d time.Duration) ClientOption {
 // limit of 10 MiB is measured on the compressed body, which log JSON reaches
 // only far beyond this. Worst-case memory held outside the sender is roughly
 // 2 × MaxInFlight batches of this size, before compression.
+//
+// It also sets the sender's own resident floor, which is what to lower if a
+// process is tight on memory rather than on throughput. The sender's
+// accumulation buffer and the gzip output buffer each grow to about this size
+// over the client's life and are then kept, deliberately: they are the working
+// set of every batch, so releasing them would buy an allocation per flush
+// forever. A framing buffer used to be a third — an encoder that implements
+// IdentityFramer, as the default one does, no longer needs it at all.
 func WithMaxBatchBytes(n int) ClientOption {
 	return func(c *clientConfig) { c.maxBatchBytes = n }
 }
@@ -851,12 +859,19 @@ type batch struct {
 // batch. That per-goroutine ownership is what keeps the reused gzip.Writer
 // sound now that compression is no longer confined to the sender.
 type packer struct {
-	scratch []byte      // framing buffer, reused across batches
-	gz      *compressor // nil when compression is off
+	enc Encoder
+	// identity records the IdentityFramer answer, asked once here rather than
+	// per batch, which is also what the interface promises encoders.
+	identity bool
+	scratch  []byte      // framing buffer, reused across batches; unused if identity
+	gz       *compressor // nil when compression is off
 }
 
-func newPacker(comp Compression) *packer {
-	p := &packer{}
+func newPacker(enc Encoder, comp Compression) *packer {
+	p := &packer{enc: enc}
+	if f, ok := enc.(IdentityFramer); ok {
+		p.identity = f.FrameIsIdentity()
+	}
 	if comp == CompressionGzip {
 		p.gz = newCompressor()
 	}
@@ -871,7 +886,7 @@ func newPacker(comp Compression) *packer {
 // which is why raw is kept unframed: the array encoder's opening bracket
 // belongs to the batch, not to the records, so a half cannot simply be a byte
 // range of the parent's body.
-func (p *packer) split(enc Encoder, b *batch) (left, right *batch, err error) {
+func (p *packer) split(b *batch) (left, right *batch, err error) {
 	mid := b.records / 2
 	cut := b.bounds[mid-1]
 
@@ -883,10 +898,10 @@ func (p *packer) split(enc Encoder, b *batch) (left, right *batch, err error) {
 		rightBounds[i] = end - cut
 	}
 
-	if left, err = p.pack(enc, b.raw[:cut], b.bounds[:mid]); err != nil {
+	if left, err = p.pack(b.raw[:cut], b.bounds[:mid]); err != nil {
 		return nil, nil, err
 	}
-	if right, err = p.pack(enc, b.raw[cut:], rightBounds); err != nil {
+	if right, err = p.pack(b.raw[cut:], rightBounds); err != nil {
 		return nil, nil, err
 	}
 	return left, right, nil
@@ -898,10 +913,16 @@ func (p *packer) split(enc Encoder, b *batch) (left, right *batch, err error) {
 // raw must already be owned by the caller on the batch's behalf: it is retained
 // as-is, so that a later split can re-frame from it. Framing happens on the
 // packer's scratch buffer rather than on raw, because Frame may write into the
-// buffer it is given and raw has to survive intact.
-func (p *packer) pack(enc Encoder, raw []byte, bounds []int) (*batch, error) {
-	p.scratch = enc.Frame(append(p.scratch[:0], raw...), len(bounds))
-	framed := p.scratch
+// buffer it is given and raw has to survive intact — unless the encoder has
+// declared its framing to be the identity (IdentityFramer), in which case there
+// is nothing to write and raw is already the body. That is the default encoder's
+// case: it saves a copy of every batch, and the scratch buffer with it.
+func (p *packer) pack(raw []byte, bounds []int) (*batch, error) {
+	framed := raw
+	if !p.identity {
+		p.scratch = p.enc.Frame(append(p.scratch[:0], raw...), len(bounds))
+		framed = p.scratch
+	}
 
 	body := framed
 	if p.gz != nil {
@@ -912,9 +933,11 @@ func (p *packer) pack(enc Encoder, raw []byte, bounds []int) (*batch, error) {
 		body = compressed
 	}
 	return &batch{
-		// Invariant 3: both the scratch buffer and the compressor's output
-		// buffer are reused, so the batch takes its own copy of whichever one
-		// it ended up with.
+		// Invariant 3: the scratch buffer and the compressor's output buffer are
+		// both reused, so the batch takes its own copy of whichever one it ended
+		// up with. On the identity path with compression off it ends up with raw
+		// instead, which it already owns — the copy is redundant there, and kept
+		// anyway so that the batch's body is never an alias of anything.
 		body:     append([]byte(nil), body...),
 		records:  len(bounds),
 		rawBytes: len(framed),

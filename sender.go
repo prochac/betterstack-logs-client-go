@@ -52,7 +52,7 @@ func newSender(c *Client) *sender {
 		buf:            make([]byte, 0, 64<<10),
 		timer:          newStoppedTimer(),
 		reportTicker:   time.NewTicker(c.cfg.dropReportInterval),
-		pk:             newPacker(c.cfg.compression),
+		pk:             newPacker(c.cfg.encoder, c.cfg.compression),
 		lastDropReport: time.Now(),
 	}
 }
@@ -196,7 +196,7 @@ func (s *sender) flush(ctx context.Context) {
 	bounds := append([]int(nil), s.bounds...)
 	s.reset()
 
-	b, err := s.pk.pack(s.c.cfg.encoder, raw, bounds)
+	b, err := s.pk.pack(raw, bounds)
 	if err != nil {
 		s.c.report(fmt.Errorf("betterstack: compressing %d record(s): %w", records, err))
 		s.c.stats.droppedRejected.Add(uint64(records))
@@ -229,7 +229,7 @@ func (s *sender) dispatch(ctx context.Context, b *batch) {
 		return
 	}
 
-	left, right, err := s.pk.split(s.c.cfg.encoder, b)
+	left, right, err := s.pk.split(b)
 	if err != nil {
 		s.c.report(fmt.Errorf("betterstack: splitting %d record(s): %w", b.records, err))
 		s.c.stats.droppedRejected.Add(uint64(b.records))

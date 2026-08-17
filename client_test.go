@@ -523,6 +523,90 @@ func (e *tallyEncoder) AppendRecord(dst []byte, event map[string]any) ([]byte, e
 
 func (e *tallyEncoder) calls() uint64 { return uint64(e.n.Load()) }
 
+// --- framing ----------------------------------------------------------------
+
+// An encoder that declares its framing to be the identity is taken at its word:
+// the accumulated records are the body already, so they are never copied into
+// the packer's framing buffer on the way to the compressor.
+func TestIdentityFramingSkipsTheFramingBuffer(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte("{\"a\":1}\n{\"b\":2}\n")
+	bounds := []int{8, 16}
+
+	p := newPacker(NDJSON(), CompressionNone)
+	b, err := p.pack(raw, bounds)
+	if err != nil {
+		t.Fatalf("pack: %v", err)
+	}
+	if p.scratch != nil {
+		t.Errorf("the framing buffer holds %d byte(s) after an identity-framed batch, want none at all", len(p.scratch))
+	}
+	if got := string(b.body); got != string(raw) {
+		t.Errorf("body = %q, want %q", got, raw)
+	}
+
+	// The other side of it: an encoder that really frames still gets its buffer,
+	// so the saving is not a framing pass quietly skipped for everyone.
+	q := newPacker(JSONArray(), CompressionNone)
+	framed, err := q.pack([]byte(`,{"a":1},{"b":2}`), bounds)
+	if err != nil {
+		t.Fatalf("pack: %v", err)
+	}
+	if q.scratch == nil {
+		t.Error("the framing buffer is unused for an encoder whose Frame is not the identity")
+	}
+	if got, want := string(framed.body), `[{"a":1},{"b":2}]`; got != want {
+		t.Errorf("body = %q, want %q", got, want)
+	}
+}
+
+// The fast path is a declaration, not a type assertion on this package's own
+// NDJSON encoder — which is the whole reason IdentityFramer is exported. A
+// third-party line-delimited encoder gets it too, and gets the promise that goes
+// with it: Frame is not called at all.
+func TestIdentityFramingIsOpenToAnyEncoder(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	enc := &lineEncoder{Encoder: NDJSON()}
+	c, _ := newTestClient(t, rec, WithEncoder(enc), WithBatchSize(3))
+	defer c.Close()
+
+	enqueueN(t, c, 3)
+	rec.waitForRequests(t, 1)
+
+	if got := enc.frames(); got != 0 {
+		t.Errorf("Frame ran %d time(s) for an encoder declaring it the identity, want 0", got)
+	}
+	// The recorder decodes the NDJSON, so this is also the check that skipping
+	// the framing pass left a body the server can still read.
+	if got := len(rec.records()); got != 3 {
+		t.Errorf("got %d records on the wire, want 3", got)
+	}
+}
+
+// lineEncoder is a third-party-shaped encoder: its own type, delegating the
+// format, declaring its own framing to be the identity, and counting the Frame
+// calls that declaration promises will not happen. The declaration has to be
+// made here — embedding an Encoder promotes the Encoder methods and nothing
+// else, so a wrapper never inherits one.
+type lineEncoder struct {
+	Encoder
+	n atomic.Int64
+}
+
+var _ IdentityFramer = (*lineEncoder)(nil)
+
+func (e *lineEncoder) FrameIsIdentity() bool { return true }
+
+func (e *lineEncoder) Frame(batch []byte, n int) []byte {
+	e.n.Add(1)
+	return e.Encoder.Frame(batch, n)
+}
+
+func (e *lineEncoder) frames() int64 { return e.n.Load() }
+
 // --- burst protection -------------------------------------------------------
 
 // A window of an hour makes the limit a plain count for the duration of the

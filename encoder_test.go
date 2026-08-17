@@ -151,6 +151,30 @@ func TestNDJSONFrameIsIdentity(t *testing.T) {
 	}
 }
 
+// …and it says so, which is what lets the client skip the framing copy. The
+// encoders that do frame must not say it, or their batches would go out
+// unframed.
+func TestOnlyNDJSONDeclaresIdentityFraming(t *testing.T) {
+	t.Parallel()
+
+	f, ok := NDJSON().(IdentityFramer)
+	if !ok {
+		t.Fatal("NDJSON() does not implement IdentityFramer")
+	}
+	if !f.FrameIsIdentity() {
+		t.Error("NDJSON().FrameIsIdentity() = false, want true")
+	}
+
+	for name, enc := range map[string]Encoder{
+		"JSONArray": JSONArray(),
+		"MsgPack":   MsgPack(msgpack.Marshal),
+	} {
+		if f, ok := enc.(IdentityFramer); ok && f.FrameIsIdentity() {
+			t.Errorf("%s() declares its framing to be the identity, but its Frame writes", name)
+		}
+	}
+}
+
 // --- JSON array -------------------------------------------------------------
 
 func TestJSONArrayContentType(t *testing.T) {

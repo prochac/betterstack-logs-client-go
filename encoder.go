@@ -39,12 +39,40 @@ type Encoder interface {
 
 	// Frame completes a batch of n records assembled by AppendRecord. It may
 	// append to, and modify in place, the batch it is given, and returns the
-	// result. For line-delimited formats it is the identity.
+	// result. For line-delimited formats it is the identity, and such an
+	// encoder should say so by also implementing IdentityFramer.
 	//
 	// Frame is called on a buffer the caller is free to reuse afterwards, and
 	// it may be called more than once on the same records: splitting an
 	// oversized batch re-frames each half from the original record bytes.
 	Frame(batch []byte, n int) []byte
+}
+
+// IdentityFramer is the optional interface an Encoder implements to declare
+// that its Frame is the identity — that Frame returns the batch it was given,
+// unmodified, whatever the batch, so that a request body is exactly the
+// concatenation of its records.
+//
+// Declaring it lets the client compress the accumulated records where they
+// already are. Framing otherwise happens on a scratch buffer the client owns,
+// because Frame may write into the buffer it is handed and the unframed records
+// have to survive intact for a possible split; that buffer costs a copy of every
+// batch, and holds a batch's worth of memory for the life of the client. NDJSON
+// implements this interface, and any other line-delimited format should.
+//
+// The declaration is not inherited by wrapping, in either direction: embedding
+// an Encoder promotes the Encoder methods and nothing else, so a wrapper around
+// NDJSON that keeps its framing has to say this itself, and one that adds
+// framing of its own says nothing and is framed normally. That is the safe way
+// round — the client asks the encoder it was given, whose Frame is the one it
+// would otherwise call.
+type IdentityFramer interface {
+	// FrameIsIdentity reports whether Frame returns its batch unmodified.
+	//
+	// It is asked once, not per batch, so it must answer the same way for the
+	// life of the encoder. An encoder that answers true is held to it: Frame is
+	// then never called at all.
+	FrameIsIdentity() bool
 }
 
 // ObjectAppender writes the JSON encoding of one record to dst, appending in
@@ -93,6 +121,11 @@ type ndjsonEncoder struct{ appendObject ObjectAppender }
 func (ndjsonEncoder) ContentType() string { return "application/x-ndjson" }
 
 func (ndjsonEncoder) Frame(batch []byte, _ int) []byte { return batch }
+
+// FrameIsIdentity implements IdentityFramer: a batch of NDJSON is its records
+// and nothing else, so there is nothing for Frame to do and no reason for the
+// client to copy the records anywhere in order to have it done.
+func (ndjsonEncoder) FrameIsIdentity() bool { return true }
 
 func (e ndjsonEncoder) AppendRecord(dst []byte, v map[string]any) ([]byte, error) {
 	n := len(dst)
