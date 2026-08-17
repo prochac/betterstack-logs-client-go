@@ -294,6 +294,15 @@ func WithRetryCeiling(d time.Duration) ClientOption {
 //
 // The ingesting host speaks HTTP/2, so concurrent uploads multiplex over one
 // TCP connection: concurrency costs streams, not sockets or handshakes.
+//
+// A slot is held for a batch's entire retry sequence, backoff sleeps included,
+// so this bounds batches in progress rather than requests on the wire. During
+// an outage every worker can be asleep rather than uploading, and a batch that
+// becomes deliverable the moment the server recovers still waits out the sleep
+// in progress ahead of it. RetryCeiling is what bounds that wait — it gates
+// every sleep, so no slot is held sleeping for longer than it. Raising
+// MaxInFlight buys pipelining through such a window; it does not shorten the
+// sleeps.
 func WithMaxInFlight(n int) ClientOption {
 	return func(c *clientConfig) { c.maxInFlight = n }
 }
@@ -320,6 +329,15 @@ func WithShutdownTimeout(d time.Duration) ClientOption {
 }
 
 // WithCompression selects the request body encoding. Default CompressionGzip.
+//
+// Compression runs on the single sender goroutine, because no gzip.Writer may
+// be shared, which makes it the client's whole-process throughput ceiling: one
+// core's worth of gzip.BestSpeed, which BenchmarkCompress measures at ~210MB/s
+// of raw NDJSON on a 2023 laptop core. That is far above any real logging
+// volume, and it is the first wall a synthetic throughput benchmark meets.
+// CompressionNone removes the ceiling and costs roughly 8–12× the bytes on the
+// wire, which is the wrong trade unless something else is paying for the
+// bandwidth.
 func WithCompression(comp Compression) ClientOption {
 	return func(c *clientConfig) { c.compression = comp }
 }

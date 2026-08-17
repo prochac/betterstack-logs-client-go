@@ -31,6 +31,16 @@ const (
 //
 // Four details here silently defeat connection reuse if missed, and each costs
 // a full TCP and TLS handshake per batch when it is.
+//
+// One thing is deliberately absent: an HTTP/2 health-check ping. A connection
+// killed silently by a NAT or a load balancer while idle is not discovered
+// until something is written into it, so the first upload after a quiet spell
+// fails and spends one attempt out of that batch's retry budget before the
+// redial succeeds. The standard library does expose the knob —
+// Transport.HTTP2.SendPingTimeout, added in Go 1.24 — but go.mod's floor is
+// 1.21, so reaching it means raising the floor or carrying a second
+// build-tagged pair of files, to pre-empt a network error the retry loop
+// already classifies as retryable and absorbs. See DESIGN §5.
 func newTransport(cfg *clientConfig) *http.Transport {
 	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
