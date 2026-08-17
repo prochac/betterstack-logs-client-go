@@ -97,6 +97,11 @@ burns quota forever and can never succeed. A batch refused as too large is
 halved and both pieces resent; only a single record too large on its own is
 dropped.
 
+`Retry-After` is honoured up to the retry ceiling and no further: a wait that
+would end past the batch's 60s budget is not taken at all, so a throttle asking
+for the whole window drops the batch instead of parking an upload slot for a
+minute. Raise `WithRetryCeiling` if you would rather wait it out.
+
 ## Client options
 
 | Option                                    | Default                           | Notes                                                                                                                            |

@@ -539,6 +539,40 @@ func TestRetryCeilingCutsRetriesShort(t *testing.T) {
 	}
 }
 
+// A Retry-After longer than the ceiling ends the batch on its first attempt,
+// rather than being honoured past the budget. The recorder answers 202 once its
+// script runs out, so a client that took the wait anyway would deliver the
+// batch on the retry — which is exactly what must not happen here.
+func TestRetryAfterBeyondCeilingGivesUpAtOnce(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t,
+		withStatuses(429),
+		withResponseHeader("Retry-After", "1"),
+	)
+	c, errs := newTestClient(t, rec,
+		WithBatchSize(1000),
+		WithRetryBackoff(time.Millisecond), // irrelevant: Retry-After overrides it
+		WithRetryCeiling(200*time.Millisecond),
+	)
+	defer c.Close()
+
+	enqueueN(t, c, 3)
+	if err := c.Flush(context.Background()); err == nil {
+		t.Fatal("Flush = nil, want the batch to have been given up on")
+	}
+
+	if got := rec.count(); got != 1 {
+		t.Errorf("got %d requests, want 1: the 1s Retry-After was waited out inside a 200ms ceiling", got)
+	}
+	if got := c.Stats().DroppedRejected; got != 3 {
+		t.Errorf("Stats().DroppedRejected = %d, want 3", got)
+	}
+	if got := errs.len(); got == 0 {
+		t.Error("OnError never fired for a batch given up on")
+	}
+}
+
 func TestRetryCeilingIsValidated(t *testing.T) {
 	t.Parallel()
 

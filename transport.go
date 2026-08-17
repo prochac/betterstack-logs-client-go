@@ -105,6 +105,11 @@ func (w *worker) uploadBy(ctx context.Context, b *batch, deadline time.Time) err
 		if attempt > 0 {
 			delay := backoff(c.cfg.retryBackoff, attempt, retryAfter, rnd)
 			if time.Now().Add(delay).After(deadline) {
+				// The wait is not taken at all if it would end past the
+				// deadline, which is what makes a long Retry-After terminal
+				// rather than slow: at the default ceiling, a first-attempt
+				// 429 asking for 60s gives up right here. See WithRetryCeiling
+				// for why that is the wanted answer.
 				break
 			}
 			if err := sleepCtx(ctx, delay); err != nil {

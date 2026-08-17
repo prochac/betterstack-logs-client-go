@@ -256,6 +256,18 @@ func WithRetryBackoff(d time.Duration) ClientOption {
 // Shutdown bounds it further still — Close cancels in-flight uploads when
 // ShutdownTimeout expires, aborting any batch parked in a backoff.
 //
+// Its interaction with Retry-After is sharper than "the tighter wins" suggests,
+// and the arithmetic is worth stating outright: a wait that would end past the
+// deadline is not taken at all, so at the default ceiling a 429 answering the
+// very first attempt with Retry-After: 60 drops the batch there and then, and
+// Retry-After: 30 buys exactly one retry. That is deliberate. A server asking
+// to be left alone for as long as the entire budget has, in effect, declined
+// the batch, and waiting it out would pin one of the MaxInFlight upload slots
+// for a minute with the queue backing up behind it. OpenTelemetry's exporter
+// resolves the same collision the same way, giving up with "max retry time
+// would elapse" rather than honouring the throttle past its ceiling. Raise the
+// ceiling if surviving long throttles matters more than shedding under them.
+//
 // A batch split after a 413 keeps its parent's ceiling rather than starting a
 // fresh one, so splitting cannot extend the budget either.
 func WithRetryCeiling(d time.Duration) ClientOption {
