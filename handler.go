@@ -149,6 +149,9 @@ func WithFilter(f func(context.Context, slog.Record) bool) HandlerOption {
 
 // WithConverter replaces the function that builds each record's payload. It is
 // the supported way to change the wire shape. See Converter.
+//
+// A nil Converter keeps the default. Internally that is also how the default is
+// represented — see the comment in Handle.
 func WithConverter(conv Converter) HandlerOption {
 	return func(c *handlerConfig) {
 		if conv != nil {
@@ -177,9 +180,9 @@ func NewHandler(c *Client, opts ...HandlerOption) *Handler {
 }
 
 func newHandler(sink enqueuer, opts ...HandlerOption) *Handler {
+	// converter is left nil, meaning DefaultConverter. See Handle.
 	cfg := handlerConfig{
 		level:      slog.LevelInfo,
-		converter:  DefaultConverter,
 		contextKey: DefaultContextKey,
 	}
 	for _, opt := range opts {
@@ -226,9 +229,36 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 	}
 
 	attrs := b.build(h.goas, attrsFromContext(ctx, h.cfg.attrFromContext), &r, source, h.cfg.extraFields)
-	payload := h.cfg.converter(&r, attrs, ConvertOptions{ContextKey: h.cfg.contextKey})
+
+	// A nil converter means DefaultConverter, and the default has to be called
+	// directly from here. h.cfg.converter is a function value, so the compiler
+	// cannot see where &r goes and must assume it is retained — and escape
+	// analysis is not path-sensitive, so the indirect call's mere presence
+	// anywhere in this function would move r (288 bytes) to the heap on every
+	// record, default converter or not. Hence the nil sentinel rather than an
+	// unconditionally installed DefaultConverter, and hence convert being a
+	// separate method taking the record by value: the copy that pays for the
+	// escape is its own, on the path that actually needs it.
+	if h.cfg.converter != nil {
+		return h.client.Enqueue(h.convert(r, attrs))
+	}
+
+	payload := DefaultConverter(&r, attrs, ConvertOptions{ContextKey: h.cfg.contextKey})
 
 	return h.client.Enqueue(payload)
+}
+
+// convert runs a custom Converter. It takes the record by value so that the
+// heap copy the indirect call forces stays on this path; see Handle.
+//
+// The pragma below is load-bearing and not a hint: this body is cheap enough
+// for the inliner, and inlined back into Handle it puts the indirect call on
+// Handle's only path again, moving Handle's own record to the heap on every
+// record. Verified — removing it brings "moved to heap: r" back in Handle.
+//
+//go:noinline
+func (h *Handler) convert(r slog.Record, attrs map[string]any) map[string]any {
+	return h.cfg.converter(&r, attrs, ConvertOptions{ContextKey: h.cfg.contextKey})
 }
 
 // WithAttrs returns a handler that also includes attrs, sharing the same
