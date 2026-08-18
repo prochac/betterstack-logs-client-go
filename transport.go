@@ -43,7 +43,7 @@ const (
 // Transport.HTTP2.SendPingTimeout, added in Go 1.24 — but go.mod's floor is
 // 1.21, so reaching it means raising the floor or carrying a second
 // build-tagged pair of files, to pre-empt a network error the retry loop
-// already classifies as retryable and absorbs. See DESIGN §5.
+// already classifies as retryable and absorbs.
 func newTransport(cfg *clientConfig) *http.Transport {
 	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
@@ -280,14 +280,15 @@ func (c *Client) do(ctx context.Context, b *batch) (status int, retryAfter time.
 // The rule is terminal by default: retry only what is explicitly retryable, and
 // drop everything else. That matters because the documented status list is not
 // what the endpoint actually returns — the docs name 403 for a bad source
-// token, but the live host answers 401 (PARITY §1, probed 2026-08-06). A client
+// token, but the live host answers 401 (observed 2026-08-06). A client
 // that retried anything it did not recognise would put the single most common
 // misconfiguration into an infinite retry loop, burning the customer's quota
 // forever without ever succeeding.
 //
 // Terminal, and each for a reason no amount of waiting changes: 401 and 403
 // (the token is wrong), 402 (out of quota), 406 (we sent something unparseable
-// — our bug), 413 (the body is too big; splitting it is a later milestone).
+// — our bug), 413 (the body is too big, so the same bytes can only fail again;
+// a batch of more than one record is split and resent instead of retried).
 func isRetryable(status int) bool {
 	switch {
 	case status == http.StatusRequestTimeout, // 408

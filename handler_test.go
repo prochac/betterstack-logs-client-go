@@ -324,7 +324,7 @@ func TestContextAttrsYieldToRealAttrs(t *testing.T) {
 // twice (golang/go#59365). Here the tree is a map, so the collision collapses to
 // the last write — which is what makes a call-site attribute override the
 // With(...) chain that produced the logger, and is the resolution every consumer
-// of the payload applies anyway. DESIGN §4, "Duplicate keys".
+// of the payload applies anyway.
 func TestDuplicateKeysCollapseToTheLastWrite(t *testing.T) {
 	t.Parallel()
 

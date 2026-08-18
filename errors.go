@@ -45,8 +45,8 @@ func (e *StatusError) Error() string {
 	return b.String()
 }
 
-// statusHint turns the status codes documented in PARITY.md §1 into the action
-// the operator has to take. The endpoint's own body is terse ({"error":
+// statusHint turns a rejection status into the action the operator has to
+// take. The endpoint's own body is terse ({"error":
 // "Unauthorized"}), and a logging client's errors are read by someone who is
 // not looking at our source.
 func statusHint(code int) string {
@@ -54,14 +54,14 @@ func statusHint(code int) string {
 	case 401, 403:
 		// The docs name 403 for a bad token, but the live endpoint answers 401
 		// with {"error": "Unauthorized"} for both a missing and a bogus token
-		// (PARITY §1, probed 2026-08-06). Both are handled, both are terminal.
+		// (observed 2026-08-06). Both are handled, both are terminal.
 		return "the source token was rejected; check the token passed to NewClient"
 	case 402:
 		return "quota exceeded"
 	case 406:
 		return "the endpoint could not parse the request body; this is a bug in this client"
 	case 413:
-		return "request over the size limit; lower WithMaxBatchBytes"
+		return "over the request size limit; batches are split and resent automatically, so this is one record too large to send"
 	default:
 		return ""
 	}

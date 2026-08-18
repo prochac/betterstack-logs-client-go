@@ -6,10 +6,9 @@ import (
 	"sync"
 )
 
-// This is the record encoder, on every toolchain. It uses the encoding/json
-// **v1 API** deliberately, and that is a decision rather than an omission — see
-// DESIGN §4, which records that a second implementation over encoding/json/v2
-// was built, measured and reverted.
+// This is the record encoder, on every toolchain. It uses the encoding/json v1
+// API deliberately, and that is a decision rather than an omission: a second
+// implementation over encoding/json/v2 was built, measured and reverted.
 //
 // The short version: v1's behaviour is pinned by Go's compatibility promise, so
 // this file needs no build tag, no options, and no test to notice a toolchain
@@ -21,7 +20,7 @@ import (
 // encoding/json cannot walk a map[string]any cheaply — every value is an
 // interface, so the map encoder reflects over each one and boxes it again on
 // the way out, at 15 allocations and ~1.3 µs for the default record shape. That
-// is the price of the map API (DESIGN §4, "Duplicate keys"), and this file pays
+// is the price of the map API, and this file pays
 // it rather than reimplementing JSON to avoid it. The fastjson subpackage is
 // for callers who would rather not: same output, 0 allocations.
 

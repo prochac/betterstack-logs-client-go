@@ -458,12 +458,12 @@ func TestPayloadTooLargeSingleRecordIsDropped(t *testing.T) {
 	}
 	found := false
 	for _, e := range errs.all() {
-		if strings.Contains(e.Error(), "WithMaxBatchBytes") {
+		if strings.Contains(e.Error(), "one record too large") {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("no error named WithMaxBatchBytes: %v", errs.all())
+		t.Errorf("no error explaining the unsplittable record: %v", errs.all())
 	}
 }
 

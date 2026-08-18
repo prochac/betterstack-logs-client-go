@@ -101,8 +101,7 @@ func WithAttrFromContext(extractors ...func(context.Context) []slog.Attr) Handle
 
 // WithExtraFields adds attributes to every record the handler produces —
 // service name, environment, region, the facts that are true of the whole
-// process. It is the Go spelling of the Erlang client's extra_fields and the
-// Java client's appName.
+// process. The official clients provide the same setting.
 //
 // They are placed at the root of the attribute tree, so with the default
 // context key they appear inside "context" alongside ordinary attributes, and
@@ -131,7 +130,7 @@ func WithExtraFields(fields map[string]any) HandlerOption {
 }
 
 // WithFilter sets a predicate deciding, per record, whether it is sent.
-// Returning true sends it. It is the Ruby client's filter_sent_to_better_stack.
+// Returning true sends it.
 //
 // This is not level filtering: WithLevel answers whether the record is produced
 // at all, and slog skips building one that is not. A filter runs on a record
@@ -258,9 +257,9 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 //
 // The new list is allocated at exactly the length required, so no append ever
 // writes into a parent's backing array. Deriving two handlers from one parent
-// and logging through both concurrently is therefore safe by construction —
-// growing a shared slice in place is a live data race in the library this one
-// replaces, and it needs no synchronisation to avoid, only an exact-size copy.
+// and logging through both concurrently is therefore safe by construction:
+// growing a shared slice in place would be a data race, and avoiding it takes
+// no synchronisation, only an exact-size copy.
 func (h *Handler) withGroupOrAttrs(goa groupOrAttrs) *Handler {
 	clone := *h
 	clone.goas = make([]groupOrAttrs, len(h.goas)+1)

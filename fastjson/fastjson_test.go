@@ -371,7 +371,7 @@ func FuzzAppendTime(f *testing.F) {
 	f.Add(int64(253402300800), int64(0), 0)   // year 10000: out of range
 	f.Add(int64(-62135596801), int64(0), 0)   // year 0 and earlier
 	f.Add(int64(0), int64(0), 25*60*60)       // zone offset RFC 3339 cannot spell
-	f.Add(int64(0), int64(0), -25*60*60)      //
+	f.Add(int64(0), int64(0), -25*60*60)      // likewise, west of UTC
 	f.Add(int64(1786000000), int64(1), 30*60) // half-hour zone, one nanosecond
 	f.Add(int64(1786000000), int64(999999999), -8*60*60)
 

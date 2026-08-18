@@ -4,8 +4,10 @@ import "log/slog"
 
 // Reserved top-level keys in the Better Stack payload.
 const (
-	// KeyTime is the timestamp field the ingestion API reads. See PARITY.md §1
-	// for the accepted encodings.
+	// KeyTime is the timestamp field the ingestion API reads. It accepts UNIX
+	// seconds, milliseconds or nanoseconds, or an RFC 3339 / ISO 8601 string;
+	// an unparseable value is stored as a plain string and the server's
+	// reception time is used instead.
 	KeyTime = "dt"
 	// KeyLevel is the severity field.
 	KeyLevel = "level"
@@ -16,10 +18,8 @@ const (
 // DefaultContextKey is where attributes are nested by default.
 //
 // "context" rather than "extra": it matches the vocabulary the other official
-// Better Stack clients use — the .NET clients nest structured data under
-// context.properties, and the Ruby and Python clients expose scoped "context"
-// blocks — and it is what this library's own README documented even while the
-// code did something else.
+// Better Stack clients use, several of which nest structured data under a
+// "context" block of their own.
 const DefaultContextKey = "context"
 
 // ConvertOptions carries the record-shape settings a Converter needs.
@@ -65,7 +65,7 @@ type Converter func(r *slog.Record, attrs map[string]any, o ConvertOptions) map[
 // A record with no timestamp omits dt entirely rather than sending the zero
 // time or substituting the current one. The slog contract says a zero
 // Record.Time means "ignore the time", and the ingestion API stamps its own
-// reception time when dt is absent (PARITY §1) — which is more accurate than a
+// reception time when dt is absent — which is more accurate than a
 // client-side stamp applied at batch-assembly time, potentially a batch
 // interval and several retry backoffs after the event, from an unsynchronised
 // clock.

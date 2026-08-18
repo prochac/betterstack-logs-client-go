@@ -22,7 +22,7 @@ func TestStatusErrorMessage(t *testing.T) {
 			contains: []string{"401", "7 record", "source token", "Unauthorized"},
 		},
 		{
-			// The docs name 403; the live endpoint answers 401 (PARITY §1).
+			// The docs name 403; the live endpoint answers 401.
 			// Both must read the same way.
 			name:     "403 names the source token too",
 			err:      &StatusError{StatusCode: 403, Records: 1},
@@ -39,9 +39,9 @@ func TestStatusErrorMessage(t *testing.T) {
 			contains: []string{"406", "bug in this client"},
 		},
 		{
-			name:     "413 names the knob to turn",
-			err:      &StatusError{StatusCode: 413, Records: 1000},
-			contains: []string{"413", "WithMaxBatchBytes"},
+			name:     "413 explains that one record is too large on its own",
+			err:      &StatusError{StatusCode: 413, Records: 1},
+			contains: []string{"413", "one record too large"},
 		},
 		{
 			name:     "an unknown status still reports cleanly",

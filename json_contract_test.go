@@ -16,7 +16,7 @@ import (
 //
 // This file was written when there were two implementations behind a build tag
 // — json_stdlib.go and a json_v2.go over encoding/json/v2 — and its job was to
-// stop them drifting. The v2 file has since been removed (DESIGN §4), so the
+// stop them drifting. The v2 file has since been removed, so the
 // contract now has one implementation to hold, and the reason it is still worth
 // asserting is that these are the properties that made v2 unusable as a
 // drop-in: invalid UTF-8 survives rather than failing the record, a Duration
@@ -47,7 +47,7 @@ func decodeRecord(t *testing.T, payload map[string]any) map[string]any {
 // A log message carries whatever bytes the application put in it. Rejecting a
 // record for a stray byte would lose the line, and encoding/json/v2 does
 // exactly that by default — which is one of the reasons the v1 API is what this
-// package encodes with (DESIGN §4).
+// package encodes with.
 func TestJSONInvalidUTF8IsSubstitutedNotRejected(t *testing.T) {
 	t.Parallel()
 
@@ -117,7 +117,7 @@ func TestJSONDoesNotEscapeHTML(t *testing.T) {
 // This is a regression guard, not an API promise: nothing about payload key
 // order is documented, and no consumer should depend on it. It exists because
 // the library shipped a release that lost this property without anything
-// failing (DESIGN §4), and it is what would have caught it.
+// failing, and it is what would have caught it.
 func TestJSONKeysAreSorted(t *testing.T) {
 	t.Parallel()
 
@@ -166,8 +166,7 @@ func keyOrder(s string, want []string) []string {
 	return got
 }
 
-// dt is the field the ingestion API reads. RFC 3339 with nanoseconds is what
-// DESIGN §4 specifies and what both implementations must produce.
+// dt is the field the ingestion API reads, as RFC 3339 with nanoseconds.
 func TestJSONTimeIsRFC3339Nano(t *testing.T) {
 	t.Parallel()
 

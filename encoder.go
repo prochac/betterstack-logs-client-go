@@ -135,8 +135,8 @@ func (e ndjsonEncoder) AppendRecord(dst []byte, v map[string]any) ([]byte, error
 }
 
 // JSONArray returns an encoder that sends a batch as one JSON array, as
-// application/json. The ingestion API accepts it (PARITY §1); NDJSON remains the
-// default because it needs no framing pass at all.
+// application/json. The ingestion API accepts it; NDJSON remains the default
+// because it needs no framing pass at all.
 //
 // The separator problem this solves is worth stating, because the obvious
 // solution does not work here. A record is encoded by Enqueue, alone, long

@@ -45,7 +45,7 @@
 // batch. That matters because the ingestion API's size limit is measured on
 // compressed bytes. No JSON reader is permitted to care about member order and
 // nothing here promises one — the sort exists to make consecutive records
-// resemble each other, and DESIGN §4 records the reasoning.
+// resemble each other.
 //
 // Sorting is why an object of more than 32 keys costs one allocation; below
 // that the key slice lives on the stack.

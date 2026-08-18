@@ -30,33 +30,32 @@ import (
 //
 //  3. Every buffer handed across a goroutine boundary is owned by the receiver.
 //     The sender reuses both its accumulation buffer and the gzip output
-//     buffer, so a dispatched batch carries its own copy. The library this one
-//     replaces could hand its reused buffer straight to a send only because
-//     that send was synchronous; with concurrent uploads the same code
-//     silently corrupts in-flight request bodies.
+//     buffer, so a dispatched batch carries its own copy. Handing a reused
+//     buffer straight to a send is sound only while that send is synchronous;
+//     with concurrent uploads it corrupts request bodies already on the wire.
 
 // DefaultEndpoint is Better Stack's ingesting host.
 const DefaultEndpoint = "https://in.logs.betterstack.com"
 
-// Defaults for the client options, sourced from the sibling official clients.
-// See PARITY.md §2 for where each number comes from.
+// Defaults for the client options. Where a sibling official client has an
+// equivalent setting, its value is taken rather than invented.
 const (
-	defaultBatchSize       = 1000                   // JS and Java agree
-	defaultBatchInterval   = time.Second            // JS; Java is 3s, 1s ships a lone line sooner
-	defaultMaxBatchBytes   = 5 << 20                // conservative against the 10 MiB limit
-	defaultMaxQueueSize    = 100_000                // Java maxQueueSize, drop over
-	defaultMaxRetries      = 5                      // Java
-	defaultRetryBackoff    = 300 * time.Millisecond // Java retrySleepMilliseconds
-	defaultMaxInFlight     = 5                      // JS syncMax
-	defaultTimeout         = 10 * time.Second       // Java readTimeout
-	defaultConnectTimeout  = 5 * time.Second        // Java connectTimeout
+	defaultBatchSize       = 1000
+	defaultBatchInterval   = time.Second
+	defaultMaxBatchBytes   = 5 << 20
+	defaultMaxQueueSize    = 100_000
+	defaultMaxRetries      = 5
+	defaultRetryBackoff    = 300 * time.Millisecond
+	defaultMaxInFlight     = 5
+	defaultTimeout         = 10 * time.Second
+	defaultConnectTimeout  = 5 * time.Second
 	defaultShutdownTimeout = 15 * time.Second
-	defaultRetryCeiling    = 60 * time.Second // OpenTelemetry otlploghttp
+	defaultRetryCeiling    = 60 * time.Second
 )
 
 const (
 	// hardMaxRequestBytes is the ingestion API's documented per-request limit,
-	// measured on the compressed body (PARITY §1). MaxBatchBytes is an
+	// measured on the compressed body. MaxBatchBytes is an
 	// uncompressed assembly cap and so is far more conservative than this;
 	// this is the backstop that stops a doomed request being sent at all.
 	hardMaxRequestBytes = 10 << 20
@@ -197,14 +196,18 @@ func WithEndpoint(endpoint string) ClientOption {
 }
 
 // WithBatchSize sets how many records accumulate before a batch is sent.
-// Default 1000, matching the JavaScript and Java clients.
+// Default 1000, matching the official clients.
 func WithBatchSize(n int) ClientOption {
 	return func(c *clientConfig) { c.batchSize = n }
 }
 
 // WithBatchInterval sets how long a partial batch waits before being sent
 // anyway. The timer starts when a batch takes its first record, so an idle
-// client does no work. Default 1s.
+// client does no work.
+//
+// Default 1s. The official clients ship 1s and 3s; the shorter interval ships
+// a lone log line correspondingly sooner, which is what an idle service mostly
+// produces.
 func WithBatchInterval(d time.Duration) ClientOption {
 	return func(c *clientConfig) { c.batchInterval = d }
 }
@@ -233,8 +236,8 @@ func WithMaxBatchBytes(n int) ClientOption {
 // blocked: Handle runs in the calling application's critical path, so blocking
 // there would turn a Better Stack outage into an application outage. A record
 // offered to a full queue is not encoded either, so a sustained outage sheds at
-// the cost of a length read per record. Default 100000, matching the Java
-// client.
+// the cost of a length read per record. Default 100000, matching the official
+// clients.
 func WithMaxQueueSize(n int) ClientOption {
 	return func(c *clientConfig) { c.maxQueueSize = n }
 }
@@ -259,9 +262,9 @@ func WithMaxQueueSize(n int) ClientOption {
 //
 // It is off by default because the right ceiling is a property of the
 // application, not of the library, and a limit guessed on the application's
-// behalf would drop its logs without being asked. The JavaScript client, the
-// only official one with this feature, ships 10000 records per 5s; that is a
-// reasonable starting point, and a deliberately conservative one for Go.
+// behalf would drop its logs without being asked. The one official client that
+// has this feature ships 10000 records per 5s; that is a reasonable starting
+// point, and a deliberately conservative one for Go.
 func WithBurstProtection(maxRecords int, window time.Duration) ClientOption {
 	return func(c *clientConfig) {
 		c.burstMax = maxRecords
@@ -271,8 +274,8 @@ func WithBurstProtection(maxRecords int, window time.Duration) ClientOption {
 
 // WithMaxRetries sets how many times a failed upload is retried after the
 // initial attempt, so the default of 5 permits at most 6 requests and
-// WithMaxRetries(0) means "send once, never retry". This matches the Java
-// client's maxRetries.
+// WithMaxRetries(0) means "send once, never retry". This matches the official
+// clients.
 //
 // Only retryable failures are retried: 408, 429, 5xx and network errors. A
 // rejected source token or an unparseable body is terminal, because retrying
@@ -282,14 +285,15 @@ func WithMaxRetries(n int) ClientOption {
 }
 
 // WithRetryBackoff sets the base delay for retries, which grow exponentially
-// with full jitter. A Retry-After response header overrides it. Default 300ms.
+// with full jitter. A Retry-After response header overrides it. Default 300ms,
+// matching the official clients.
 func WithRetryBackoff(d time.Duration) ClientOption {
 	return func(c *clientConfig) { c.retryBackoff = d }
 }
 
 // WithRetryCeiling bounds the total time one batch may spend across all of its
-// attempts, including the waits between them. Default 60s, OpenTelemetry's
-// number for the same job.
+// attempts, including the waits between them. Default 60s, the number
+// OpenTelemetry's otlploghttp exporter uses for the same job.
 //
 // It is a second limit alongside MaxRetries, and the tighter of the two wins: a
 // generous retry count cannot keep a batch alive indefinitely against a server
@@ -315,8 +319,8 @@ func WithRetryCeiling(d time.Duration) ClientOption {
 	return func(c *clientConfig) { c.retryCeiling = d }
 }
 
-// WithMaxInFlight caps concurrent uploads. Default 5, matching the JavaScript
-// client's syncMax.
+// WithMaxInFlight caps concurrent uploads. Default 5, matching the official
+// clients.
 //
 // The ingesting host speaks HTTP/2, so concurrent uploads multiplex over one
 // TCP connection: concurrency costs streams, not sockets or handshakes.
@@ -334,16 +338,16 @@ func WithMaxInFlight(n int) ClientOption {
 }
 
 // WithTimeout sets the timeout for a single upload attempt. Default 10s,
-// matching the Java client's readTimeout. It is applied as a per-request
-// context deadline and so is honoured by any HTTP client, including one
-// supplied through WithHTTPClient.
+// matching the official clients. It is applied as a per-request context
+// deadline and so is honoured by any HTTP client, including one supplied
+// through WithHTTPClient.
 func WithTimeout(d time.Duration) ClientOption {
 	return func(c *clientConfig) { c.timeout = d }
 }
 
 // WithConnectTimeout sets the TCP connect timeout. Default 5s, matching the
-// Java client. It has no effect when WithHTTPClient is used, since the dialer
-// belongs to the supplied client's transport.
+// official clients. It has no effect when WithHTTPClient is used, since the
+// dialer belongs to the supplied client's transport.
 func WithConnectTimeout(d time.Duration) ClientOption {
 	return func(c *clientConfig) { c.connectTimeout = d }
 }
@@ -358,12 +362,10 @@ func WithShutdownTimeout(d time.Duration) ClientOption {
 //
 // Compression runs on the single sender goroutine, because no gzip.Writer may
 // be shared, which makes it the client's whole-process throughput ceiling: one
-// core's worth of gzip.BestSpeed, which BenchmarkCompress measures at ~210MB/s
-// of raw NDJSON on a 2023 laptop core. That is far above any real logging
-// volume, and it is the first wall a synthetic throughput benchmark meets.
-// CompressionNone removes the ceiling and costs roughly 8–12× the bytes on the
-// wire, which is the wrong trade unless something else is paying for the
-// bandwidth.
+// core's worth of gzip.BestSpeed, on the order of 200MB/s of raw NDJSON. That
+// is far above any real logging volume. CompressionNone removes the ceiling
+// and costs roughly 8–12× the bytes on the wire, which is the wrong trade
+// unless something else is paying for the bandwidth.
 func WithCompression(comp Compression) ClientOption {
 	return func(c *clientConfig) { c.compression = comp }
 }
@@ -411,9 +413,9 @@ func WithOnError(f func(error)) ClientOption {
 //
 // Records are still converted, encoded, queued, batched, framed and compressed,
 // and Flush and Close still behave normally — only the POST is skipped, and the
-// records are counted as Sent. It is the kill switch the JavaScript client
-// spells sendLogsToBetterStack, and it exists so that tests and local
-// development exercise the real code path without spending quota.
+// records are counted as Sent. It is the kill switch the official clients
+// provide, and it exists so that tests and local development exercise the real
+// code path without spending quota.
 //
 // A dry-run client needs no source token: NewClient("", WithDryRun(true))
 // succeeds, since demanding a credential for the mode whose point is not having
@@ -826,9 +828,8 @@ func (c *Client) Close() error {
 
 		if c.ownsTransport {
 			// Retires net/http's per-connection read and write goroutines.
-			// Without this, goleak fails and the tempting fix is to ignore
-			// those frames, which would hide a client that never releases its
-			// connections.
+			// Without it a closed client leaves them running, holding
+			// connections it will never use again.
 			c.transport.CloseIdleConnections()
 		}
 
@@ -982,10 +983,10 @@ func (p *packer) pack(raw []byte, bounds []int) (*batch, error) {
 
 // compressor wraps a reusable gzip.Writer and its output buffer.
 //
-// Reuse is safe only because compression happens on the sender goroutine, which
-// is the single writer. Compressing there rather than in the upload workers is
-// deliberate: it keeps that reuse valid, shrinks the memory held by queued
-// batches, and means a retry re-sends bytes instead of recompressing them.
+// Reuse is safe only because a compressor belongs to exactly one goroutine, via
+// the packer that owns it. Compressing during batch assembly rather than at
+// upload time is deliberate: it shrinks the memory held by queued batches, and
+// means a retry re-sends bytes instead of recompressing them.
 type compressor struct {
 	buf *sliceWriter
 	w   *gzip.Writer

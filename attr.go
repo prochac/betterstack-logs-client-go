@@ -67,7 +67,8 @@ type treeBuilder struct {
 // agrees: JSONHandler writes its built-in source before the record's attrs, so
 // an attribute keyed "source" appears second and, under the last-wins rule that
 // every JSON consumer applies, is the one that survives. Emitting both is not
-// open to us — see DESIGN §4 — so yielding is how the same outcome is reached.
+// open to us — the tree is a map, so a key appears once — so yielding is how
+// the same outcome is reached.
 func (b *treeBuilder) build(goas []groupOrAttrs, ctxAttrs []slog.Attr, r *slog.Record, source, extra map[string]any) map[string]any {
 	root := b.walk(goas, nil, func(dst map[string]any, groups []string) {
 		r.Attrs(func(a slog.Attr) bool {
@@ -211,10 +212,10 @@ func (b *treeBuilder) appendAttr(dst map[string]any, groups []string, a slog.Att
 
 	// Plain assignment, so a repeated key overwrites and the last write wins.
 	// That is the whole of this package's duplicate-key policy, and it is
-	// deliberate rather than a side effect of the tree being a map: see
-	// DESIGN §4. Do not make this yield to the existing value — slog's own
-	// semantics are that a call-site attribute overrides one from the With
-	// chain that produced the logger, and reversing that here would make this
+	// deliberate rather than a side effect of the tree being a map. Do not make
+	// this yield to the existing value — slog's own semantics are that a
+	// call-site attribute overrides one from the With chain that produced the
+	// logger, and reversing that here would make this
 	// the only handler where it does not.
 	dst[a.Key] = b.value(a.Value)
 }
@@ -295,8 +296,7 @@ func sourceValue(pc uintptr) (map[string]any, bool) {
 // The result is always a freshly allocated slice. Appending extracted
 // attributes onto a slice owned by the handler is a data race the moment two
 // goroutines log through handlers derived from a common parent, because the
-// derived handlers share that slice's backing array. That bug is live in the
-// library this one replaces.
+// derived handlers share that slice's backing array.
 func attrsFromContext(ctx context.Context, extractors []func(context.Context) []slog.Attr) []slog.Attr {
 	if len(extractors) == 0 || ctx == nil {
 		return nil
