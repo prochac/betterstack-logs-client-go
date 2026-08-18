@@ -435,7 +435,9 @@ func TestAppendRecordDoesNotAllocate(t *testing.T) {
 	}
 }
 
-// A nil appender is a construction-time error, matching MsgPack.
+// A nil appender is a construction-time error: an encoder that cannot encode
+// has nothing useful to fall back on, so failing at construction beats failing
+// per record.
 func TestNilObjectAppenderPanics(t *testing.T) {
 	t.Parallel()
 

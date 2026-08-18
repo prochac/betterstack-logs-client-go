@@ -11,8 +11,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	msgpack "github.com/shamaton/msgpack/v2"
 )
 
 const testToken = "src_test_token"
@@ -213,28 +211,6 @@ func (r *recorder) check(header http.Header, raw []byte) recordedRequest {
 		}
 		if len(records) == 0 {
 			r.t.Errorf("empty JSON array body: %q", body)
-		}
-		for _, m := range records {
-			line, err := json.Marshal(m)
-			if err != nil {
-				r.t.Errorf("re-marshalling a decoded record: %v", err)
-				continue
-			}
-			captured.lines = append(captured.lines, line)
-			captured.records = append(captured.records, m)
-		}
-
-	case "application/msgpack":
-		// Decoded with a third-party codec rather than one of our own, so that
-		// what this asserts is that the framing is interoperable MessagePack and
-		// not merely that we can read back what we wrote.
-		var records []map[string]any
-		if err := msgpack.Unmarshal(body, &records); err != nil {
-			r.t.Errorf("body is not a MessagePack array of maps: %v (% x)", err, body)
-			break
-		}
-		if len(records) == 0 {
-			r.t.Errorf("empty MessagePack array body: % x", body)
 		}
 		for _, m := range records {
 			line, err := json.Marshal(m)

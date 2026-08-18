@@ -6,11 +6,7 @@
 #     golangci-lint run ./...
 #     golangci-lint fmt ./...
 #
-# One blind spot is worth knowing about: msgpackcompat/ is a separate module, so
-# `./...` does not reach it. Run golangci-lint from inside it; it finds this file
-# by walking up.
-#
-# There used to be a second — a build-tagged json_v2.go this run could not
+# There used to be a blind spot — a build-tagged json_v2.go this run could not
 # compile. That file is gone (DESIGN §4), so `./...` now lints every line the
 # library ships. Reintroducing a build tag would reintroduce the blind spot,
 # since v2.12 is built with go1.26 and its go/types panics on a 1.27 stdlib.

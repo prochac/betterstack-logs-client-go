@@ -4,8 +4,7 @@ A [Better Stack](https://betterstack.com/logs) logging client for Go: a
 `log/slog` handler backed by a batching, retrying HTTP client.
 
 Standard library only — no dependencies outside it, and none planned. Go 1.21 or
-newer. (The optional MessagePack encoder takes a codec as an argument rather than
-bundling one, so it does not change that; see [MessagePack](#messagepack).)
+newer.
 
 ```sh
 go get github.com/prochac/logs-client-go
@@ -127,7 +126,7 @@ minute. Raise `WithRetryCeiling` if you would rather wait it out.
 | `WithConnectTimeout(time.Duration)`       | `5s`                              | TCP connect; no effect with `WithHTTPClient`                                                                                     |
 | `WithShutdownTimeout(time.Duration)`      | `15s`                             | how long `Close` waits                                                                                                           |
 | `WithCompression(Compression)`            | `CompressionGzip`                 | `CompressionNone` to disable                                                                                                     |
-| `WithEncoder(Encoder)`                    | `NDJSON()`                        | also `JSONArray()`, `MsgPack(marshal)`, and `NDJSONWith`/`JSONArrayWith` for a custom `ObjectAppender`                           |
+| `WithEncoder(Encoder)`                    | `NDJSON()`                        | also `JSONArray()`, and `NDJSONWith`/`JSONArrayWith` for a custom `ObjectAppender`                                               |
 | `WithOnError(func(error))`                | one line per event to stderr      | must not log through this handler                                                                                                |
 | `WithDryRun(bool)`                        | `false`                           | run everything except the request                                                                                                |
 | `WithHTTPClient(*http.Client)`            | tuned internal client             | escape hatch; the client is not owned or closed                                                                                  |
@@ -210,7 +209,6 @@ on the calling goroutine. go1.26.6, linux/amd64, i7-1355U:
 | `JSONArray()`                                         |  3500 |   769 |        23 |        222 |
 | `NDJSONWith(fastjson.AppendObject)`                   |   910 | **0** |     **0** |        222 |
 | `JSONArrayWith(fastjson.AppendObject)`                |   880 | **0** |     **0** |        222 |
-| `MsgPack(msgpack.Marshal)` — `vmihailenco/msgpack/v5` |  1030 |   496 |         4 |    **165** |
 
 And the same choice measured where you actually pay for it, one whole
 `logger.Info` call on a dry-run client — attribute tree, `Converter`, encode and
@@ -222,9 +220,8 @@ the queue hand-off:
 | `JSONArray()`                          |  6900 | 2.6 KiB |        40 |
 | `NDJSONWith(fastjson.AppendObject)`    |  4300 | 2.2 KiB |        21 |
 | `JSONArrayWith(fastjson.AppendObject)` |  4200 | 2.2 KiB |        21 |
-| `MsgPack` — `vmihailenco/msgpack/v5`   |  3600 | 2.3 KiB |        20 |
 
-Three things to read off them:
+Two things to read off them:
 
 - **The framing is free; the encoding is not.** NDJSON and JSONArray differ by
   one byte per record and nothing measurable, because both hand the record to
@@ -234,11 +231,6 @@ Three things to read off them:
   what `encoding/json` produces for this payload shape — same key order, same
   size — for a quarter of the time and none of the allocations. That is asserted
   in the suite, not just observed here.
-- **MessagePack is smaller per record and larger per request.** 165 bytes against
-  222 uncompressed, but bodies are gzipped: a batch of 100 records that vary in
-  their values is 22.8 KB of NDJSON compressing to **1.67 KB**, against 17.1 KB
-  of MessagePack compressing to **2.24 KB**. Every record in a batch repeats the
-  same key sequence, and that is the compressor's biggest back-reference source.
 
 Timings on a laptop swing about ±20% between runs, so they are rounded; the
 allocation and byte columns are exact and did not vary, and the ordering held in
@@ -286,49 +278,16 @@ concrete struct types, and a `map[string]any` gives them nothing to cache.
 `goccy/go-json` is about 20% faster than `encoding/json` here and
 `json-iterator` is slower.
 
-### MessagePack
+### Why there is no MessagePack encoder
 
-`MsgPack` sends `application/msgpack`, but it ships no codec — you pass one in.
-Most libraries' `Marshal` can be handed over directly:
-
-```go
-import "github.com/vmihailenco/msgpack/v5"
-
-betterstack.WithEncoder(betterstack.MsgPack(msgpack.Marshal))
-```
-
-`vmihailenco/msgpack/v5`, `shamaton/msgpack/v3`, `ugorji/go/codec` and
-`hashicorp/go-msgpack/v2` all work here. `vmihailenco/msgpack/v5` is the
-fastest of them on a `map[string]any` — 4 allocations per record where
-`shamaton` takes 30 — and is the one the numbers above use.
-
-One built around a reusable handle needs a closure:
-
-```go
-import "github.com/ugorji/go/codec"
-
-h := &codec.MsgpackHandle{}
-h.WriteExt = true // without this the timestamp extension degrades to raw bytes
-
-betterstack.WithEncoder(betterstack.MsgPack(func(v any) ([]byte, error) {
-    var out []byte
-    return out, codec.NewEncoderBytes(&out, h).Encode(v)
-}))
-```
-
-No codec is bundled for two reasons. Libraries disagree about timestamps, struct
-tags and whether a Go string becomes `str` or `bin`, and that is your call to
-make — as is keeping it patched. And you probably have one in the build already;
-picking for you would add a second. This package contributes only the array
-framing, which is a length prefix rather than a serialiser, so it stays
-dependency-free.
-
-**Do not switch expecting smaller requests.** Bodies are gzipped by default, and
-gzipped MessagePack is usually no smaller than gzipped JSON — on the batch
-measured above it was **34% larger**, because JSON's repeated keys and ASCII
-digits compress extremely well. The reasons to choose it are exact
-`int64`/`uint64`, native binary, the timestamp extension type, and matching what
-the Node client sends.
+There was one, and it was removed after measuring it: it gained nothing. Encode
+time tied `fastjson`, which costs no dependency, and the gzipped body — the
+thing the API's request limit and your bill are measured on — came out **34%
+larger** than NDJSON, because a batch's repeated key sequence is exactly what
+gzip compresses best. Precision is not a reason either: JSON *text* carries
+`int64`/`uint64` as exact digits, and a value that must survive every pipeline
+regardless of decoders belongs in a string. If you want speed, use `fastjson`
+above; DESIGN §4 has the full record of the measurements.
 
 ## Extra fields and filtering
 

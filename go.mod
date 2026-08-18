@@ -8,12 +8,4 @@ go 1.21
 //
 // goleak enforces that the sender goroutine and the upload workers terminate
 // deterministically on Close rather than leaking until exit.
-//
-// shamaton/msgpack supplies a MessagePack codec to the tests. MsgPack ships none
-// — it takes a Marshaler from the caller — so the tests have to bring one, and
-// bringing an independent implementation is what makes them evidence of
-// interoperability rather than of agreeing with ourselves.
-require (
-	github.com/shamaton/msgpack/v2 v2.4.1
-	go.uber.org/goleak v1.3.0
-)
+require go.uber.org/goleak v1.3.0

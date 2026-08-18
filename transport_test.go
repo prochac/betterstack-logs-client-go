@@ -10,8 +10,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	msgpack "github.com/shamaton/msgpack/v2"
 )
 
 // --- classification ---------------------------------------------------------
@@ -376,64 +374,6 @@ func TestPayloadTooLargeSplitsWithJSONArray(t *testing.T) {
 
 			// The recorder has already failed the test if any body — including
 			// the refused ones — was not a valid JSON array of objects.
-			if got := c.Stats().Sent; got != records {
-				t.Errorf("Stats().Sent = %d, want %d", got, records)
-			}
-			if got := len(rec.accepted()); got != records {
-				t.Errorf("%d records arrived, want %d", got, records)
-			}
-			if got := errs.len(); got != 0 {
-				t.Errorf("OnError fired %d times: %v", got, errs.all())
-			}
-
-			seen := map[string]int{}
-			for _, m := range rec.accepted() {
-				seen[m[KeyMessage].(string)]++
-			}
-			if len(seen) != records {
-				t.Errorf("got %d distinct records, want %d", len(seen), records)
-			}
-		})
-	}
-}
-
-// The same for MessagePack, where the framing is a length prefix rather than a
-// pair of brackets: a split that re-frames a sub-run with the parent's record
-// count produces a header claiming more elements than follow it, which is the
-// specific way this encoder can be got wrong.
-func TestPayloadTooLargeSplitsWithMsgPack(t *testing.T) {
-	t.Parallel()
-
-	for _, comp := range []struct {
-		name string
-		opt  Compression
-	}{{"gzip", CompressionGzip}, {"none", CompressionNone}} {
-		comp := comp
-		t.Run(comp.name, func(t *testing.T) {
-			t.Parallel()
-
-			const records = 16
-			enc := MsgPack(msgpack.Marshal)
-			probe, err := enc.AppendRecord(nil, event(0))
-			if err != nil {
-				t.Fatalf("sizing a record: %v", err)
-			}
-
-			rec := newRecorder(t, withMaxAcceptedBytes(len(probe)*3))
-			c, errs := newTestClient(t, rec,
-				WithBatchSize(1000),
-				WithEncoder(enc),
-				WithCompression(comp.opt),
-			)
-			defer c.Close()
-
-			enqueueN(t, c, records)
-			if err := c.Flush(context.Background()); err != nil {
-				t.Fatalf("Flush: %v", err)
-			}
-
-			// The recorder has already failed the test if any body — including the
-			// refused ones — was not a decodable MessagePack array of maps.
 			if got := c.Stats().Sent; got != records {
 				t.Errorf("Stats().Sent = %d, want %d", got, records)
 			}
