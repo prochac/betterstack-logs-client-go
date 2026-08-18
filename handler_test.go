@@ -277,19 +277,45 @@ func TestExtraFieldsYieldToRealAttrs(t *testing.T) {
 
 	sink := &stubSink{}
 	h := newHandler(sink,
-		WithExtraFields(map[string]any{"service": "default", "env": "prod"}),
+		// "service" and "env" are hoisted ahead of the records that carry them;
+		// "boom" cannot be, since an error becomes a map that the payload's
+		// owner may rewrite. Both halves of the split obey the same precedence,
+		// and only one of them was ever checked.
+		WithExtraFields(map[string]any{"service": "default", "env": "prod", "boom": errors.New("from-extra")}),
 		WithAttrFromContext(func(context.Context) []slog.Attr {
 			return []slog.Attr{slog.String("env", "from-context")}
 		}),
 	)
-	slog.New(h).With("service", "explicit").Info("hello")
+	slog.New(h).With("service", "explicit").With("boom", "also explicit").Info("hello")
 
 	ctx := sink.last(t)[DefaultContextKey].(map[string]any)
 	if got := ctx["service"]; got != "explicit" {
 		t.Errorf("service = %v, want %q: an extra field beat a real attribute", got, "explicit")
 	}
+	if got := ctx["boom"]; got != "also explicit" {
+		t.Errorf("boom = %v, want %q: a dynamic extra field beat a real attribute", got, "also explicit")
+	}
 	if got := ctx["env"]; got != "from-context" {
 		t.Errorf("env = %v, want %q: an extra field beat a context extractor", got, "from-context")
+	}
+}
+
+// WithExtraFields(nil) is a no-op rather than a way to clear fields set
+// earlier: the option adds, and an empty map adds nothing.
+func TestWithExtraFieldsEmptyIsANoOp(t *testing.T) {
+	t.Parallel()
+
+	sink := &stubSink{}
+	logger := slog.New(newHandler(sink,
+		WithExtraFields(map[string]any{"env": "prod"}),
+		WithExtraFields(nil),
+		WithExtraFields(map[string]any{}),
+	))
+	logger.Info("hello")
+
+	ctx := sink.last(t)[DefaultContextKey].(map[string]any)
+	if got := ctx["env"]; got != "prod" {
+		t.Errorf("env = %v, want %q: an empty map cleared the fields set before it", got, "prod")
 	}
 }
 

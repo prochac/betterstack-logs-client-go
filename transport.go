@@ -102,7 +102,7 @@ type worker struct {
 
 func (w *worker) packer() *packer {
 	if w.pk == nil {
-		w.pk = newPacker(w.c.cfg.encoder, w.c.cfg.compression)
+		w.pk = newPacker(w.c.cfg.encoder, w.c.cfg.compression, w.c.cfg.newCompressSink)
 	}
 	return w.pk
 }

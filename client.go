@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -181,6 +182,31 @@ type clientConfig struct {
 	// the real interval, in the same spirit as the limiter's clock. Production
 	// only ever sees defaultDropReportInterval.
 	dropReportInterval time.Duration
+
+	// beforeLeftoverCount runs inside Close, after the sender has exited and
+	// before the records still in the queue are counted. It has no option and
+	// is nil in production. That window is the Stats identity's one documented
+	// exception — an Enqueue whose record lands after the count — and it is far
+	// too narrow for a test to occupy from the outside, so this lets one occupy
+	// it from the inside.
+	beforeLeftoverCount func()
+
+	// hardMaxBytes is the request size past which a body is split rather than
+	// sent. It has no option: the limit belongs to the ingestion API, not to
+	// the caller, and production only ever sees hardMaxRequestBytes. It is a
+	// field so that the tests can reach the splitting paths — and the failure
+	// accounting inside them — with bodies of a few dozen bytes instead of ten
+	// megabytes, which is the difference between a test that runs and one
+	// nobody would run five times over.
+	hardMaxBytes int
+
+	// newCompressSink builds the buffer a compressor writes into. It has no
+	// option and is nil in production, which means *sliceWriter. It exists
+	// because a gzip.Writer cannot fail on any input — every error it can
+	// return comes from its sink — so a sink that fails is the only way to
+	// reach compression failure, and with it all the accounting that hangs off
+	// a failed pack or a failed split.
+	newCompressSink func() compressSink
 }
 
 // ClientOption configures a Client.
@@ -530,6 +556,7 @@ func NewClient(sourceToken string, opts ...ClientOption) (*Client, error) {
 		onError:         defaultOnError,
 
 		dropReportInterval: defaultDropReportInterval,
+		hardMaxBytes:       hardMaxRequestBytes,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -732,7 +759,7 @@ func (c *Client) Enqueue(event map[string]any) error {
 	// record many times this size routinely compresses well under it. That case
 	// stays where it was — the sender's check on the finished body, and failing
 	// that the server's 413.
-	if c.cfg.compression == CompressionNone && len(buf) > hardMaxRequestBytes {
+	if c.cfg.compression == CompressionNone && len(buf) > c.cfg.hardMaxBytes {
 		c.stats.droppedOversize.Add(1)
 		c.putRecordBuf(bufp) // a formality: a record this size fails the cap check
 		return nil
@@ -843,6 +870,9 @@ func (c *Client) Close() error {
 			c.transport.CloseIdleConnections()
 		}
 
+		if c.cfg.beforeLeftoverCount != nil {
+			c.cfg.beforeLeftoverCount()
+		}
 		// Anything that slipped into the queue between the done check in
 		// Enqueue and now is accounted rather than silently lost. This read is
 		// also where the Stats identity's fine print comes from: an Enqueue
@@ -979,13 +1009,13 @@ type packer struct {
 	gz       *compressor // nil when compression is off
 }
 
-func newPacker(enc Encoder, comp Compression) *packer {
+func newPacker(enc Encoder, comp Compression, newSink func() compressSink) *packer {
 	p := &packer{enc: enc}
 	if f, ok := enc.(IdentityFramer); ok {
 		p.identity = f.FrameIsIdentity()
 	}
 	if comp == CompressionGzip {
-		p.gz = newCompressor()
+		p.gz = newCompressor(newSink)
 	}
 	return p
 }
@@ -1065,20 +1095,24 @@ func (p *packer) pack(raw []byte, bounds []int) (*batch, error) {
 // upload time is deliberate: it shrinks the memory held by queued batches, and
 // means a retry re-sends bytes instead of recompressing them.
 type compressor struct {
-	buf *sliceWriter
+	buf compressSink
 	w   *gzip.Writer
 }
 
-func newCompressor() *compressor {
-	sw := &sliceWriter{}
+func newCompressor(newSink func() compressSink) *compressor {
+	var sink compressSink = &sliceWriter{}
+	if newSink != nil {
+		// See clientConfig.newCompressSink: the tests, and nothing else.
+		sink = newSink()
+	}
 	// BestSpeed: log JSON still compresses several-fold at level 1, and CPU
 	// inside the customer's process is the scarce resource, not bandwidth.
-	w, err := gzip.NewWriterLevel(sw, gzip.BestSpeed)
+	w, err := gzip.NewWriterLevel(sink, gzip.BestSpeed)
 	if err != nil {
 		// Only reachable with an invalid level constant.
 		panic(fmt.Sprintf("betterstack: gzip.NewWriterLevel: %v", err))
 	}
-	return &compressor{buf: sw, w: w}
+	return &compressor{buf: sink, w: w}
 }
 
 // compress returns the gzip encoding of src. The result is only valid until the
@@ -1092,7 +1126,17 @@ func (c *compressor) compress(src []byte) ([]byte, error) {
 	if err := c.w.Close(); err != nil {
 		return nil, err
 	}
-	return c.buf.b, nil
+	return c.buf.bytes(), nil
+}
+
+// compressSink is the buffer a compressor's gzip.Writer writes into. Production
+// has exactly one implementation, *sliceWriter, and reset marks the start of
+// each compression. See clientConfig.newCompressSink for why it is an interface
+// at all.
+type compressSink interface {
+	io.Writer
+	reset()
+	bytes() []byte
 }
 
 // sliceWriter is an io.Writer over a reusable byte slice. bytes.Buffer would do
@@ -1105,3 +1149,5 @@ func (w *sliceWriter) Write(p []byte) (int, error) {
 }
 
 func (w *sliceWriter) reset() { w.b = w.b[:0] }
+
+func (w *sliceWriter) bytes() []byte { return w.b }

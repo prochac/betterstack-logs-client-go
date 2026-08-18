@@ -171,6 +171,35 @@ func TestSleepCtx(t *testing.T) {
 			t.Errorf("sleepCtx(0) = %v, want nil", err)
 		}
 	})
+
+	// Full jitter returns zero routinely, so this is the ordinary way a
+	// cancelled shutdown meets the sleep. Answering nil would buy the caller
+	// one more upload attempt after it was told to stop.
+	t.Run("zero duration on a dead context", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := sleepCtx(ctx, 0); !errors.Is(err, context.Canceled) {
+			t.Errorf("sleepCtx(0) = %v, want context.Canceled", err)
+		}
+	})
+}
+
+// A zero WithRetryBackoff is a legal configuration — validate rejects only a
+// negative one — and it means retry at once. The guard is what makes that true:
+// without it the jitter would be drawn from Int63n(1), which is zero today by
+// arithmetic rather than by intent.
+func TestBackoffWithoutABase(t *testing.T) {
+	t.Parallel()
+
+	rnd := rand.New(rand.NewSource(4))
+	for _, base := range []time.Duration{0, -time.Second} {
+		for attempt := 1; attempt <= 3; attempt++ {
+			if got := backoff(base, attempt, 0, rnd); got != 0 {
+				t.Errorf("backoff(%v, %d) = %v, want 0", base, attempt, got)
+			}
+		}
+	}
 }
 
 // --- retry behaviour --------------------------------------------------------

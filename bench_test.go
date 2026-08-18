@@ -327,7 +327,7 @@ func BenchmarkCompress(b *testing.B) {
 		}
 	}
 
-	gz := newCompressor()
+	gz := newCompressor(nil)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(body)))
 	b.ResetTimer()
@@ -377,7 +377,7 @@ func BenchmarkPack(b *testing.B) {
 		{"none/framed", CompressionNone, false},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
-			p := newPacker(enc, tc.comp)
+			p := newPacker(enc, tc.comp, nil)
 			p.identity = tc.identity
 
 			b.SetBytes(int64(len(raw)))

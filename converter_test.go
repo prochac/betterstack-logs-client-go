@@ -193,6 +193,12 @@ func TestGroups(t *testing.T) {
 		}
 	})
 
+	// slog.Record.Add elides a top-level empty group before Handle is ever
+	// called ("It omits empty groups", log/slog/record.go), so this case alone
+	// passes whatever the handler does — it is here to pin the observable
+	// behaviour, and the two below it are what actually reach the handler's own
+	// guard. The elision is top-level only: a group nested inside another, and
+	// one arriving through WithAttrs, are both this handler's to drop.
 	t.Run("empty group is ignored", func(t *testing.T) {
 		t.Parallel()
 		payload := logRecord(t, nil, func(l *slog.Logger) {
@@ -200,6 +206,37 @@ func TestGroups(t *testing.T) {
 		})
 		if _, present := contextOf(t, payload)["g"]; present {
 			t.Error("an empty group was emitted")
+		}
+	})
+
+	t.Run("empty group nested in another is ignored", func(t *testing.T) {
+		t.Parallel()
+		payload := logRecord(t, nil, func(l *slog.Logger) {
+			l.Info("msg", slog.Group("outer", slog.Group("inner"), slog.String("k", "v")))
+		})
+		outer, ok := contextOf(t, payload)["outer"].(map[string]any)
+		if !ok {
+			t.Fatalf("outer group is missing: %v", payload)
+		}
+		if _, present := outer["inner"]; present {
+			t.Errorf("an empty nested group was emitted: %v", outer)
+		}
+		if got := outer["k"]; got != "v" {
+			t.Errorf("outer.k = %v, want %q: the rest of the group was lost with it", got, "v")
+		}
+	})
+
+	t.Run("empty group from WithAttrs is ignored", func(t *testing.T) {
+		t.Parallel()
+		payload := logRecord(t, nil, func(l *slog.Logger) {
+			l.With(slog.Group("g")).Info("msg", slog.String("k", "v"))
+		})
+		ctx := contextOf(t, payload)
+		if _, present := ctx["g"]; present {
+			t.Errorf("an empty group reached the payload through WithAttrs: %v", ctx)
+		}
+		if got := ctx["k"]; got != "v" {
+			t.Errorf("k = %v, want %q", got, "v")
 		}
 	})
 

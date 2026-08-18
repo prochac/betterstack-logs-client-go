@@ -52,7 +52,7 @@ func newSender(c *Client) *sender {
 		buf:            make([]byte, 0, 64<<10),
 		timer:          newStoppedTimer(),
 		reportTicker:   time.NewTicker(c.cfg.dropReportInterval),
-		pk:             newPacker(c.cfg.encoder, c.cfg.compression),
+		pk:             newPacker(c.cfg.encoder, c.cfg.compression, c.cfg.newCompressSink),
 		lastDropReport: time.Now(),
 	}
 }
@@ -91,6 +91,13 @@ func (s *sender) disarm() {
 		// consumed and no other goroutine can consume it: the runtime's
 		// non-blocking send into the capacity-1 channel must have succeeded.
 		// This receive cannot block.
+		//
+		// That is the pre-Go 1.23 timer, which is what this module's go1.21
+		// floor still selects on a go1.26 toolchain. Under the synchronous
+		// channels a go1.27 toolchain gives everyone, Stop clears a fire nobody
+		// has taken and so cannot report false while one is pending: the
+		// receive becomes unreachable rather than wrong. Sound either way, and
+		// needed while either is in reach.
 		<-s.timer.C
 	}
 	s.armed = false
@@ -224,7 +231,7 @@ func (s *sender) flush(ctx context.Context) {
 // check cannot, since MaxBatchBytes is measured before compression and the
 // limit after it.
 func (s *sender) dispatch(ctx context.Context, b *batch) {
-	if len(b.body) <= hardMaxRequestBytes {
+	if len(b.body) <= s.c.cfg.hardMaxBytes {
 		s.handOff(ctx, b)
 		return
 	}

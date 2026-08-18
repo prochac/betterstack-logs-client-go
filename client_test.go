@@ -410,6 +410,60 @@ func TestCloseWithSlowServerRespectsShutdownTimeout(t *testing.T) {
 	}
 }
 
+// A record whose Enqueue lands after Close has counted the queue is the one
+// exception the Stats identity documents (invariant 10), and Close's leftover
+// count is the code that keeps it an exception rather than a hole: anything
+// still queued when the sender has gone is counted as dropped instead of
+// silently lost.
+//
+// The window is between the sender's exit and the count a few statements later,
+// which is too narrow for another goroutine to be scheduled into reliably — so
+// the test occupies it from the inside, through the seam that exists for it,
+// doing exactly what the racing Enqueue would have done: count the record as
+// offered, then put it in the queue.
+func TestCloseCountsWhatIsLeftInTheQueue(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	var c *Client
+	late := func(cfg *clientConfig) {
+		cfg.beforeLeftoverCount = func() {
+			buf, err := c.cfg.encoder.AppendRecord(nil, event(99))
+			if err != nil {
+				t.Errorf("AppendRecord: %v", err)
+				return
+			}
+			c.stats.enqueued.Add(1)
+			c.queue <- &buf
+		}
+	}
+	c, errs := newTestClient(t, rec, WithBatchSize(1), late)
+
+	enqueueN(t, c, 2)
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	stats := c.Stats()
+	if stats.Sent != 2 {
+		t.Errorf("Stats().Sent = %d, want 2: the two records that made it were delivered", stats.Sent)
+	}
+	// Delivery was healthy and nothing was abandoned, so this can only be the
+	// leftover record.
+	if stats.DroppedClosed != 1 {
+		t.Errorf("Stats().DroppedClosed = %d, want 1: the record left in the queue was not counted", stats.DroppedClosed)
+	}
+	assertStatsBalance(t, c)
+
+	var de *DropError
+	for _, err := range errs.all() {
+		if errors.As(err, &de) && de.Reason == DropClosed {
+			return
+		}
+	}
+	t.Errorf("no DropClosed summary was reported; got %v", errs.all())
+}
+
 // --- drops and accounting ---------------------------------------------------
 
 // A full queue must drop and count, never block: Handle runs in the calling
@@ -508,6 +562,115 @@ func TestQueueFullDropSkipsTheEncode(t *testing.T) {
 	}
 }
 
+// The pre-check above is an optimisation, not the decision. The decision is the
+// non-blocking send, and it is the only one a producer reaches that loses the
+// race — passing the pre-check while the queue still had room, and finding it
+// full a microsecond later. That is the ordinary case under load, and three
+// things ride on it: that Enqueue still neither blocks nor errors, that the
+// drop is counted (without which the Stats identity holds everywhere except
+// under contention), and that the record's buffer goes back to the pool
+// instead of being leaked or, worse, handed out twice.
+//
+// The race is made rather than waited for. Two producers are held inside the
+// encode at once, behind a sender that cannot drain, so both have passed the
+// pre-check against an empty queue with one slot: whichever sends second must
+// take the branch below it.
+func TestQueueFullDropAfterTheEncode(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t, withGate())
+	defer rec.release() // before the server's cleanup, and after Close below
+	enc := &gateEncoder{Encoder: NDJSON(), entered: make(chan struct{}, 2), release: make(chan struct{})}
+	c, _ := newTestClient(t, rec,
+		WithEncoder(enc),
+		WithBatchSize(1),
+		WithMaxInFlight(1),
+		WithMaxQueueSize(1),
+		WithShutdownTimeout(100*time.Millisecond), // nothing here is ever delivered
+	)
+	defer c.Close()
+
+	// Wedge the sender: one batch on the gated worker, one in the hand-off slot
+	// behind it, and the third leaves the sender blocked. One record at a time,
+	// each waited out of the queue before the next — offering all three at once
+	// risks a drop against a queue of one, and this test's whole subject is
+	// which drop happened. Once the third is out of the queue the sender is
+	// committed to the hand-off, so the queue is empty from here on and stays
+	// empty: nothing is left to drain it.
+	for i := 0; i < 3; i++ {
+		if err := c.Enqueue(event(i)); err != nil {
+			t.Fatalf("Enqueue(%d): %v", i, err)
+		}
+		waitFor(t, "the sender to take the record", func() bool { return len(c.queue) == 0 })
+	}
+	waitFor(t, "the upload pool to saturate", func() bool {
+		c.pool.mu.Lock()
+		defer c.pool.mu.Unlock()
+		return c.pool.dispatched == 2
+	})
+
+	// Counted from here: a wedging record may itself have found the queue full
+	// on the way in, and that drop is the pre-check's, not this test's.
+	before := c.Stats().DroppedQueueFull
+
+	enc.arm()
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = c.Enqueue(event(i))
+		}(i)
+	}
+	for i := 0; i < 2; i++ {
+		<-enc.entered // both are inside the encode, so both are past the pre-check
+	}
+	close(enc.release)
+	wg.Wait()
+	enc.disarm()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("Enqueue(%d) = %v, want nil: a dropped record is not an error", i, err)
+		}
+	}
+	// Exactly one: the queue had one slot, and the loser of the race cannot
+	// have been refused anywhere earlier, having reached the encoder at all.
+	if got := c.Stats().DroppedQueueFull - before; got != 1 {
+		t.Errorf("DroppedQueueFull grew by %d, want 1", got)
+	}
+	if got := enc.calls(); got != 2 {
+		t.Errorf("the encoder ran %d times for the two racers, want 2: "+
+			"one of them was refused by the pre-check, so this no longer tests the drop below it", got)
+	}
+}
+
+// gateEncoder holds every record inside AppendRecord once armed, so a test can
+// have several producers in the encode at the same moment. The format is
+// delegated, so the recorder still checks the wire.
+type gateEncoder struct {
+	Encoder
+	on      atomic.Bool
+	n       atomic.Int64
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (e *gateEncoder) arm()    { e.on.Store(true) }
+func (e *gateEncoder) disarm() { e.on.Store(false) }
+
+func (e *gateEncoder) AppendRecord(dst []byte, event map[string]any) ([]byte, error) {
+	if e.on.Load() {
+		e.n.Add(1)
+		e.entered <- struct{}{}
+		<-e.release
+	}
+	return e.Encoder.AppendRecord(dst, event)
+}
+
+func (e *gateEncoder) calls() int64 { return e.n.Load() }
+
 // tallyEncoder counts AppendRecord calls so a test can assert a record never
 // reached the encoder at all. The format is delegated, so the recorder still
 // checks the wire.
@@ -534,7 +697,7 @@ func TestIdentityFramingSkipsTheFramingBuffer(t *testing.T) {
 	raw := []byte("{\"a\":1}\n{\"b\":2}\n")
 	bounds := []int{8, 16}
 
-	p := newPacker(NDJSON(), CompressionNone)
+	p := newPacker(NDJSON(), CompressionNone, nil)
 	b, err := p.pack(raw, bounds)
 	if err != nil {
 		t.Fatalf("pack: %v", err)
@@ -548,7 +711,7 @@ func TestIdentityFramingSkipsTheFramingBuffer(t *testing.T) {
 
 	// The other side of it: an encoder that really frames still gets its buffer,
 	// so the saving is not a framing pass quietly skipped for everyone.
-	q := newPacker(JSONArray(), CompressionNone)
+	q := newPacker(JSONArray(), CompressionNone, nil)
 	framed, err := q.pack([]byte(`,{"a":1},{"b":2}`), bounds)
 	if err != nil {
 		t.Fatalf("pack: %v", err)
@@ -846,12 +1009,17 @@ func TestNewClientValidation(t *testing.T) {
 		{"blank token", "   ", nil, "source token"},
 		{"endpoint without a scheme", testToken, []ClientOption{WithEndpoint("in.logs.betterstack.com")}, "http or https"},
 		{"endpoint with the wrong scheme", testToken, []ClientOption{WithEndpoint("ftp://example.com")}, "http or https"},
+		{"unparseable endpoint", testToken, []ClientOption{WithEndpoint("http://[::1")}, "invalid endpoint"},
+		{"endpoint without a host", testToken, []ClientOption{WithEndpoint("http:///v1")}, "no host"},
 		{"zero batch size", testToken, []ClientOption{WithBatchSize(0)}, "WithBatchSize"},
 		{"negative in-flight", testToken, []ClientOption{WithMaxInFlight(-1)}, "WithMaxInFlight"},
 		{"zero queue size", testToken, []ClientOption{WithMaxQueueSize(0)}, "WithMaxQueueSize"},
 		{"negative retries", testToken, []ClientOption{WithMaxRetries(-1)}, "WithMaxRetries"},
 		{"zero batch interval", testToken, []ClientOption{WithBatchInterval(0)}, "WithBatchInterval"},
 		{"negative timeout", testToken, []ClientOption{WithTimeout(-time.Second)}, "WithTimeout"},
+		// Zero is legal here and means "retry at once", so only a negative one
+		// is refused. See TestBackoffWithoutABase.
+		{"negative retry backoff", testToken, []ClientOption{WithRetryBackoff(-time.Millisecond)}, "WithRetryBackoff"},
 		{"burst maximum without a window", testToken, []ClientOption{WithBurstProtection(10, 0)}, "WithBurstProtection"},
 		{"burst window without a maximum", testToken, []ClientOption{WithBurstProtection(0, time.Second)}, "WithBurstProtection"},
 		{"negative burst maximum", testToken, []ClientOption{WithBurstProtection(-1, -time.Second)}, "WithBurstProtection"},

@@ -48,6 +48,25 @@ func site(i int) (uintptr, callSite) {
 	return uintptr(0x400000 + i*16), callSite{function: "fn", file: "f.go", line: i}
 }
 
+// A program counter the runtime cannot symbolize yields no source key at all.
+// The alternative — a zero callSite — would put
+// {"function":"","file":"","line":0} on the record, which reads as a real
+// answer and is not one. Reachable in the wild: a stripped binary has nothing
+// to resolve against.
+func TestSourceValueOfAnUnresolvablePC(t *testing.T) {
+	t.Parallel()
+
+	// Not a return address of anything: no text segment starts here.
+	if got, ok := sourceValue(uintptr(1)); ok {
+		t.Errorf("sourceValue of an unresolvable PC = %v, true; want it omitted", got)
+	}
+	// The zero PC, which is what a Record built by hand rather than through
+	// slog.Logger carries, is the same answer by a different route.
+	if got, ok := sourceValue(0); ok {
+		t.Errorf("sourceValue(0) = %v, true; want it omitted", got)
+	}
+}
+
 func TestSourceCache(t *testing.T) {
 	t.Parallel()
 

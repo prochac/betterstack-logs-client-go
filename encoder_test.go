@@ -342,3 +342,29 @@ func TestNDJSONConcurrentUse(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// An encoder built without an ObjectAppender has no useful behaviour to fall
+// back on, so construction is where it fails: a panic at NewClient beats one
+// per record from inside Handle, on a goroutine the caller does not own.
+func TestEncoderWithNilAppenderPanics(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		make func() Encoder
+	}{
+		{"NDJSONWith", func() Encoder { return NDJSONWith(nil) }},
+		{"JSONArrayWith", func() Encoder { return JSONArrayWith(nil) }},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s(nil) returned an encoder that cannot encode", tt.name)
+				}
+			}()
+			_ = tt.make()
+		})
+	}
+}
