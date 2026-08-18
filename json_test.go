@@ -11,8 +11,11 @@ import (
 	"time"
 )
 
-// The behaviour json.go's record encoder is held to, asserted against what a
-// consumer decodes rather than against bytes.
+// --- the encoding contract --------------------------------------------------
+
+// json.go's tests: the behaviour its record encoder is held to, asserted against
+// what a consumer decodes rather than against bytes, and the pooling of the
+// scratch buffer it encodes into.
 //
 // This file was written when there were two implementations behind a build tag
 // — json_stdlib.go and a json_v2.go over encoding/json/v2 — and its job was to
@@ -302,5 +305,64 @@ func TestJSONEmptyObject(t *testing.T) {
 	}
 	if string(b) != "{}" {
 		t.Errorf("appendJSONObject(empty) = %q, want %q", b, "{}")
+	}
+}
+
+// --- the encoder pool -------------------------------------------------------
+
+// The scratch buffer json.go pools only ever grows, so one outsized
+// record would otherwise pin its capacity for the life of the process — the
+// slow kind of leak that never shows up in a benchmark and only in a long-lived
+// process that logs the occasional huge value.
+//
+// The assertion is one-sided, like the timing ones elsewhere: an empty pool
+// hands back a fresh encoder and passes, so this can only fail when the
+// oversized buffer really was retained. It is not parallel, because it reads the
+// process-wide pool.
+func TestOversizedJSONBufferIsNotPooled(t *testing.T) {
+	huge := map[string]any{"payload": strings.Repeat("x", 4*maxPooledJSONBuffer)}
+
+	b, err := appendJSONObject(nil, huge)
+	if err != nil {
+		t.Fatalf("appendJSONObject: %v", err)
+	}
+	if len(b) < 4*maxPooledJSONBuffer {
+		t.Fatalf("encoded %d bytes, want at least %d", len(b), 4*maxPooledJSONBuffer)
+	}
+
+	// Drain rather than Get once: the buffer that encoded the record above is
+	// the most recent Put on this P, but a pool holds per-P private and shared
+	// slots and nothing promises which one answers first.
+	for i := 0; i < 16; i++ {
+		e := jsonEncoders.Get().(*pooledJSONEncoder)
+		if got := e.buf.Cap(); got > maxPooledJSONBuffer {
+			t.Fatalf("pooled scratch buffer has capacity %d, over the %d cap: "+
+				"a single huge record inflates the pool permanently", got, maxPooledJSONBuffer)
+		}
+	}
+}
+
+// The cap must not quietly disable pooling for ordinary traffic: a record of the
+// usual shape has to stay well inside it, or every encode allocates a fresh
+// buffer and an *json.Encoder to go with it.
+func TestOrdinaryJSONRecordStaysPoolable(t *testing.T) {
+	t.Parallel()
+
+	e := jsonEncoders.New().(*pooledJSONEncoder)
+	if err := e.enc.Encode(map[string]any{
+		"dt":      "2026-08-17T12:00:00.000000Z",
+		"level":   "INFO",
+		"message": "request served",
+		"context": map[string]any{
+			"method": "GET",
+			"path":   "/healthz",
+			"status": 200,
+		},
+	}); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if got := e.buf.Cap(); got > maxPooledJSONBuffer {
+		t.Errorf("a typical record grew the scratch buffer to %d, past the %d cap",
+			got, maxPooledJSONBuffer)
 	}
 }

@@ -107,7 +107,7 @@ func TestAppendValueMatchesEncodingJSON(t *testing.T) {
 			t.Parallel()
 
 			want, wantErr := ref(v)
-			got, err := appendValue(nil, v)
+			got, err := appendValue(nil, v, 1)
 
 			if (err != nil) != (wantErr != nil) {
 				t.Fatalf("appendValue(%#v) error = %v, encoding/json error = %v", v, err, wantErr)
@@ -339,7 +339,7 @@ func FuzzAppendFloat(f *testing.F) {
 			{"float32", float32(v)},
 		} {
 			want, wantErr := ref(c.val)
-			got, err := appendValue(nil, c.val)
+			got, err := appendValue(nil, c.val, 1)
 
 			if (err != nil) != (wantErr != nil) {
 				t.Fatalf("%s(%v): error = %v, encoding/json error = %v", c.name, v, err, wantErr)
@@ -387,7 +387,7 @@ func FuzzAppendTime(f *testing.F) {
 		}
 
 		want, wantErr := ref(tm)
-		got, err := appendValue(nil, tm)
+		got, err := appendValue(nil, tm, 1)
 
 		if (err != nil) != (wantErr != nil) {
 			t.Fatalf("time %v (offset %d): error = %v, encoding/json error = %v", tm, offset, err, wantErr)
@@ -458,5 +458,143 @@ func TestNilObjectAppenderPanics(t *testing.T) {
 			}()
 			c.fn()
 		})
+	}
+}
+
+// --- nesting depth ----------------------------------------------------------
+
+// nest builds a chain of n nested objects, innermost first, so the value
+// returned sits at depth 1 when handed to AppendObject.
+func nest(n int) map[string]any {
+	m := map[string]any{"leaf": 1}
+	for i := 1; i < n; i++ {
+		m = map[string]any{"n": m}
+	}
+	return m
+}
+
+// The limit is a boundary, and a boundary that is one off is a limit nobody can
+// reason about: MaxDepth levels must encode, MaxDepth+1 must not.
+func TestMaxDepthBoundary(t *testing.T) {
+	t.Parallel()
+
+	// At the limit the value still has to be *right*, not merely accepted, so
+	// this is differential like everything else here.
+	at := nest(MaxDepth)
+	got, err := AppendObject(nil, at)
+	if err != nil {
+		t.Fatalf("AppendObject at MaxDepth (%d) = %v, want it to encode", MaxDepth, err)
+	}
+	want, err := ref(at)
+	if err != nil {
+		t.Fatalf("reference encoder at MaxDepth: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("at MaxDepth =\n %s\nwant %s", got, want)
+	}
+
+	over := nest(MaxDepth + 1)
+	if _, err := AppendObject(nil, over); !errors.Is(err, ErrMaxDepth) {
+		t.Errorf("AppendObject at MaxDepth+1 = %v, want ErrMaxDepth", err)
+	}
+
+	// Arrays nest too, and counting only objects would leave the same hole.
+	deep := any(1)
+	for i := 0; i < MaxDepth+1; i++ {
+		deep = []any{deep}
+	}
+	if _, err := AppendObject(nil, map[string]any{"a": deep}); !errors.Is(err, ErrMaxDepth) {
+		t.Errorf("nested arrays past MaxDepth = %v, want ErrMaxDepth", err)
+	}
+}
+
+// The reason the limit exists. Before it, this test did not fail — it killed the
+// test binary with an unrecoverable "fatal error: stack overflow", which no
+// recover and none of the client's error plumbing can intercept. A logging
+// client must not be able to take its host down over one bad log line.
+//
+// encoding/json rejects the same value by detecting the cycle, so the caller
+// sees an error either way; only the mechanism differs. That is asserted here
+// because it is the property that makes the two encoders interchangeable to the
+// caller, which is the promise of the seam.
+func TestSelfReferentialValueIsRejectedNotFatal(t *testing.T) {
+	t.Parallel()
+
+	direct := map[string]any{"k": "v"}
+	direct["self"] = direct
+	if _, err := AppendObject(nil, direct); !errors.Is(err, ErrMaxDepth) {
+		t.Errorf("directly self-referential map = %v, want ErrMaxDepth", err)
+	}
+	if _, err := ref(direct); err == nil {
+		t.Error("encoding/json accepted a cyclic map; the encoders no longer agree that it is an error")
+	}
+
+	// Through several hops, and through a slice, since a cycle need not be a
+	// map pointing straight at itself.
+	a := map[string]any{}
+	b := map[string]any{}
+	a["b"] = b
+	b["list"] = []any{a}
+	if _, err := AppendObject(nil, a); !errors.Is(err, ErrMaxDepth) {
+		t.Errorf("indirect cycle through a slice = %v, want ErrMaxDepth", err)
+	}
+}
+
+// A rejected record must leave the batch it was being appended to untouched:
+// the sender accumulates records into one buffer, so a partially written record
+// left behind would corrupt every record already in it.
+func TestMaxDepthLeavesDstIntact(t *testing.T) {
+	t.Parallel()
+
+	dst, err := AppendObject(nil, map[string]any{"first": "record"})
+	if err != nil {
+		t.Fatalf("AppendObject: %v", err)
+	}
+	before := append([]byte(nil), dst...)
+
+	cyclic := map[string]any{}
+	cyclic["self"] = cyclic
+
+	got, err := AppendObject(dst, cyclic)
+	if !errors.Is(err, ErrMaxDepth) {
+		t.Fatalf("AppendObject(cyclic) = %v, want ErrMaxDepth", err)
+	}
+	if !bytes.Equal(got, before) {
+		t.Errorf("dst was modified on error:\n got %q\nwant %q", got, before)
+	}
+}
+
+// The record shape the handler actually produces is nowhere near the limit, so
+// the guard must be invisible in normal use. (That it did not cost the package
+// its zero-allocation encode is TestAppendRecordDoesNotAllocate's job, which
+// cannot be t.Parallel and so cannot live here.)
+func TestMaxDepthDoesNotAffectRealisticRecords(t *testing.T) {
+	t.Parallel()
+
+	// Two levels is the handler's own shape: reserved keys, plus a context
+	// object holding the attributes. Groups add one level each, and a group
+	// nested 48 deep is not a thing that happens.
+	rec := map[string]any{
+		betterstack.KeyTime:    time.Date(2026, 8, 17, 10, 11, 12, 123456789, time.UTC),
+		betterstack.KeyLevel:   "INFO",
+		betterstack.KeyMessage: "request served",
+		betterstack.DefaultContextKey: map[string]any{
+			"method": "GET",
+			"http": map[string]any{
+				"status": 200,
+				"tags":   []any{"a", "b"},
+			},
+		},
+	}
+	got, err := AppendObject(nil, rec)
+	if err != nil {
+		t.Fatalf("AppendObject on a realistic record: %v", err)
+	}
+	want, err := ref(rec)
+	if err != nil {
+		t.Fatalf("reference encoder: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("realistic record =\n %s\nwant %s", got, want)
 	}
 }

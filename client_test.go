@@ -850,6 +850,154 @@ func TestNewClientEmptyTokenIsErrNoSourceToken(t *testing.T) {
 	}
 }
 
+// --- defaults ---------------------------------------------------------------
+
+// defaultClient builds a client with nothing configured, which is the
+// configuration a user gets from NewClient(token). Dry run keeps the suite off
+// the network; it sets one flag and leaves every default below untouched.
+func defaultClient(t *testing.T) *Client {
+	t.Helper()
+
+	c, err := NewClient(testToken, WithDryRun(true))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	return c
+}
+
+// The subject here is the default configuration: the default* const block and
+// the clientConfig literal NewClient installs it into. The behaviour those
+// numbers drive is tested elsewhere — batching triggers in client_test.go,
+// retry and backoff in transport_test.go, the rate limiter in limiter_test.go.
+// What is asserted here is only the values, and that each lands in the right
+// field.
+//
+// They are not free choices: each is quoted from an official Better Stack
+// client in PARITY.md §2, and recognising the knobs from another language is
+// itself an adoption criterion (§7.3). A default that drifts out of agreement
+// with that document is a silent parity regression — invisible in review,
+// because the new number looks every bit as reasonable as the old one.
+//
+// The assertions read the config the client actually runs with rather than the
+// package constants, so they also catch a field wired to its neighbour's value:
+// timeout: defaultConnectTimeout type checks, reads correctly at a glance, and
+// halves every request deadline.
+//
+// This pins the code against the document, not the document against Better
+// Stack. If Java changes batchInterval tomorrow, this still passes; re-reading
+// the sources stays a human job, and PARITY's "Fetched" stamp is what speaks to
+// how current the record is.
+func TestClientDefaultsMatchTheSiblingClients(t *testing.T) {
+	t.Parallel()
+
+	c := defaultClient(t)
+	cfg := c.cfg
+
+	t.Run("counts", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name string
+			got  int
+			want int
+			why  string
+		}{
+			{"BatchSize", cfg.batchSize, 1000, "JS and Java agree; Erlang's 50 is the outlier"},
+			{"MaxQueueSize", cfg.maxQueueSize, 100_000, "Java maxQueueSize; JS syncQueuedMax bounds requests, not records"},
+			{"MaxInFlight", cfg.maxInFlight, 5, "JS syncMax; Erlang's pool holds 10 connections"},
+			{"MaxRetries", cfg.maxRetries, 5, "Java maxRetries; JS retryCount and Erlang are both 3"},
+			{
+				"MaxBatchBytes", cfg.maxBatchBytes, 5 << 20,
+				"no sibling: JS batchSizeKiB defaults to 0, no size trigger at all. " +
+					"Here it is always on, because it is what keeps a batch under §1's " +
+					"10 MiB request limit rather than a tuning knob, and 5 MiB " +
+					"uncompressed is conservative against a limit measured compressed",
+			},
+		}
+		for _, tt := range tests {
+			if tt.got != tt.want {
+				t.Errorf("%s = %d, want %d (%s)", tt.name, tt.got, tt.want, tt.why)
+			}
+		}
+	})
+
+	t.Run("durations", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name string
+			got  time.Duration
+			want time.Duration
+			why  string
+		}{
+			{
+				"BatchInterval", cfg.batchInterval, time.Second,
+				"JS batchInterval. Java is 3s and Erlang 5s, but with a single timer the " +
+					"interval is also the latency floor for a lone log line (§4)",
+			},
+			{"RetryBackoff", cfg.retryBackoff, 300 * time.Millisecond, "Java retrySleepMilliseconds; JS retryBackoff is 100ms"},
+			{"ConnectTimeout", cfg.connectTimeout, 5 * time.Second, "Java connectTimeout"},
+			{"Timeout", cfg.timeout, 10 * time.Second, "Java readTimeout; JS transport is 30s"},
+			{
+				"RetryCeiling", cfg.retryCeiling, 60 * time.Second,
+				"no sibling documents a total retry budget; OTel's otlploghttp caps at 1 minute (§6.4)",
+			},
+			{
+				"ShutdownTimeout", cfg.shutdownTimeout, 15 * time.Second,
+				"no sibling documents one, but every one of them documents flushing " +
+					"before exit as mandatory (§2), which is what this bounds",
+			},
+		}
+		for _, tt := range tests {
+			if tt.got != tt.want {
+				t.Errorf("%s = %v, want %v (%s)", tt.name, tt.got, tt.want, tt.why)
+			}
+		}
+	})
+
+	t.Run("wire", func(t *testing.T) {
+		t.Parallel()
+
+		if got, want := cfg.endpoint, "https://in.logs.betterstack.com"; got != want {
+			t.Errorf("Endpoint = %q, want %q (JS endpoint, Java ingestUrl)", got, want)
+		}
+		// The 10 MiB request limit is measured on compressed bytes (§1), so
+		// compression directly multiplies throughput.
+		if cfg.compression != CompressionGzip {
+			t.Errorf("Compression = %v, want CompressionGzip", cfg.compression)
+		}
+		// NDJSON, a documented Better Stack encoding (§1), over the JSON array:
+		// a record's encoding is then self-delimiting and position-independent.
+		if got, want := cfg.encoder.ContentType(), "application/x-ndjson"; got != want {
+			t.Errorf("default encoder ContentType = %q, want %q", got, want)
+		}
+	})
+
+	// The one place this client deliberately refuses a sibling's default rather
+	// than adopting or adapting it. JS ships burstProtectionMax 10000 per
+	// burstProtectionMilliseconds 5000, on by default; that ceiling is
+	// calibrated for Node, and silently capping a Go service at 2000 rec/s
+	// would be a surprise (DESIGN §2). Backpressure is shed at the queue and
+	// nowhere else; the limiter is an admission ceiling an operator declares.
+	t.Run("burst protection is opt-in", func(t *testing.T) {
+		t.Parallel()
+
+		if cfg.burstMax != 0 || cfg.burstWindow != 0 {
+			t.Errorf("burst protection configured by default: max=%d window=%v", cfg.burstMax, cfg.burstWindow)
+		}
+		// The config is the input; the limiter is what Enqueue consults on every
+		// record. Only the second one can actually throttle a caller.
+		if c.limiter != nil {
+			t.Error("a limiter was built with no WithBurstProtection")
+		}
+	})
+}
+
 // --- error surfacing --------------------------------------------------------
 
 // An encoding failure is local and synchronous, so it comes back from Enqueue

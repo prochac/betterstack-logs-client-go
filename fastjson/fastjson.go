@@ -49,11 +49,40 @@
 //
 // Sorting is why an object of more than 32 keys costs one allocation; below
 // that the key slice lives on the stack.
+//
+// # Nesting is bounded
+//
+// Objects and arrays nest at most [MaxDepth] deep; past that, encoding fails
+// with [ErrMaxDepth] and the record is rejected rather than sent truncated.
+//
+// The limit is not a style rule, it is what makes this package safe to hand an
+// arbitrary attribute value. An attribute is an any, so a caller can log a
+// map[string]any that contains itself, directly or through several hops. The
+// recursion here would then not terminate, and unbounded recursion in Go is not
+// a panic a caller can recover from — it is a fatal stack overflow that takes
+// the host application with it, from inside slog.Handler.Handle, on the
+// goroutine that called the logger. A logging client must not be able to do
+// that to its host.
+//
+// A depth counter rather than cycle detection, which is what encoding/json does
+// instead: detection needs a set of the pointers already visited, allocated on
+// every encode, which is the cost this package exists to avoid — and it would
+// be paid by every record whether or not any cyclic value is ever logged. The
+// counter is one argument and one comparison per level, and it is the stronger
+// guard of the two: a cycle is just unbounded depth, so this catches it, while
+// a non-cyclic value nested a hundred thousand deep overflows encoding/json's
+// stack exactly as it would this one, and its cycle detector says nothing about
+// that.
+//
+// The limit governs this package's own recursion. A value that falls through to
+// encoding/json — a struct, a json.Marshaler — is encoded by it entirely, under
+// its rules and not this counter.
 package fastjson
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"math"
 	"slices"
 	"strconv"
@@ -71,12 +100,32 @@ import (
 // it are untouched.
 func AppendObject(dst []byte, m map[string]any) ([]byte, error) {
 	n := len(dst)
-	dst, err := appendObject(dst, m)
+	dst, err := appendObject(dst, m, 1)
 	if err != nil {
 		return dst[:n], err
 	}
 	return dst, nil
 }
+
+// MaxDepth is how deeply objects and arrays may nest. The object passed to
+// [AppendObject] is depth 1, so a value inside it may itself nest MaxDepth-1
+// further containers.
+//
+// The value is the one the official JavaScript client uses for the same purpose
+// (contextObjectMaxDepth), and is far beyond any record a log line produces:
+// slog groups nest one level per group, and the handler's own record shape is
+// two. See the package doc for why the limit exists at all.
+const MaxDepth = 50
+
+// ErrMaxDepth is returned when a value nests deeper than [MaxDepth], which in
+// practice means it contains itself.
+//
+// It fails the record rather than truncating it at the limit and sending what
+// fits, which is what the JavaScript client does. A truncated payload arrives
+// looking complete and is wrong only where nobody is looking; an error reaches
+// the caller through slog.Handler.Handle, which is where this package's other
+// encoding failures already go.
+var ErrMaxDepth = errors.New("fastjson: value nests deeper than MaxDepth")
 
 // maxStackKeys is how many keys an object can have before sorting them needs the
 // heap. Records are shallow — a handful of reserved keys and a context group —
@@ -85,7 +134,13 @@ func AppendObject(dst []byte, m map[string]any) ([]byte, error) {
 // grows the slice normally and costs one allocation on that record alone.
 const maxStackKeys = 32
 
-func appendObject(dst []byte, m map[string]any) ([]byte, error) {
+// depth is the nesting depth of m itself: 1 for the object AppendObject was
+// given, one more for each container it is inside.
+func appendObject(dst []byte, m map[string]any, depth int) ([]byte, error) {
+	if depth > MaxDepth {
+		return dst, ErrMaxDepth
+	}
+
 	dst = append(dst, '{')
 
 	// Keys are sorted, so that every record in a batch presents the same key
@@ -107,11 +162,32 @@ func appendObject(dst []byte, m map[string]any) ([]byte, error) {
 		}
 		dst = appendString(dst, k)
 		dst = append(dst, ':')
-		if dst, err = appendValue(dst, m[k]); err != nil {
+		if dst, err = appendValue(dst, m[k], depth); err != nil {
 			return dst, err
 		}
 	}
 	return append(dst, '}'), nil
+}
+
+// appendArray is appendObject's counterpart for []any, and carries the depth
+// for the same reason: a slice can contain itself just as a map can.
+func appendArray(dst []byte, a []any, depth int) ([]byte, error) {
+	if depth > MaxDepth {
+		return dst, ErrMaxDepth
+	}
+
+	dst = append(dst, '[')
+
+	var err error
+	for i, e := range a {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		if dst, err = appendValue(dst, e, depth); err != nil {
+			return dst, err
+		}
+	}
+	return append(dst, ']'), nil
 }
 
 // appendValue appends the JSON encoding of v to dst.
@@ -122,7 +198,10 @@ func appendObject(dst []byte, m map[string]any) ([]byte, error) {
 // an int64 here — and that is the correct outcome: they take the encoding/json
 // path, which is where their MarshalJSON, MarshalText or default rendering
 // lives.
-func appendValue(dst []byte, v any) ([]byte, error) {
+//
+// depth is the nesting depth of the container v was found in; a container v
+// opens is one deeper.
+func appendValue(dst []byte, v any, depth int) ([]byte, error) {
 	switch x := v.(type) {
 	case nil:
 		return append(dst, "null"...), nil
@@ -157,19 +236,9 @@ func appendValue(dst []byte, v any) ([]byte, error) {
 	case time.Time:
 		return appendTime(dst, x)
 	case map[string]any:
-		return appendObject(dst, x)
+		return appendObject(dst, x, depth+1)
 	case []any:
-		dst = append(dst, '[')
-		var err error
-		for i, e := range x {
-			if i > 0 {
-				dst = append(dst, ',')
-			}
-			if dst, err = appendValue(dst, e); err != nil {
-				return dst, err
-			}
-		}
-		return append(dst, ']'), nil
+		return appendArray(dst, x, depth+1)
 	default:
 		return appendOther(dst, v)
 	}
