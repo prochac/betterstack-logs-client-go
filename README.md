@@ -127,7 +127,7 @@ minute. Raise `WithRetryCeiling` if you would rather wait it out.
 | `WithConnectTimeout(time.Duration)`       | `5s`                              | TCP connect; no effect with `WithHTTPClient`                                                                                     |
 | `WithShutdownTimeout(time.Duration)`      | `15s`                             | how long `Close` waits                                                                                                           |
 | `WithCompression(Compression)`            | `CompressionGzip`                 | `CompressionNone` to disable                                                                                                     |
-| `WithEncoder(Encoder)`                    | `NDJSON()`                        | also `JSONArray()`, `MsgPack(marshal)`, and `NDJSONWith`/`JSONArrayWith` for a custom `ObjectAppender`                            |
+| `WithEncoder(Encoder)`                    | `NDJSON()`                        | also `JSONArray()`, `MsgPack(marshal)`, and `NDJSONWith`/`JSONArrayWith` for a custom `ObjectAppender`                           |
 | `WithOnError(func(error))`                | one line per event to stderr      | must not log through this handler                                                                                                |
 | `WithDryRun(bool)`                        | `false`                           | run everything except the request                                                                                                |
 | `WithHTTPClient(*http.Client)`            | tuned internal client             | escape hatch; the client is not owned or closed                                                                                  |
@@ -198,6 +198,60 @@ would have copied into.
 Gzip is on by default because the API's 10 MiB request limit is measured on
 *compressed* bytes, so it multiplies how much fits in a request.
 
+### What each encoder costs
+
+One record — the payload a `logger.Info` with six attributes produces —
+appended to the buffer the sender reuses, which is exactly what `Enqueue` does
+on the calling goroutine. go1.26.6, linux/amd64, i7-1355U:
+
+| Encoder                                               | ns/op |  B/op | allocs/op | wire bytes |
+|-------------------------------------------------------|------:|------:|----------:|-----------:|
+| `NDJSON()`                                            |  3600 |   769 |        23 |        222 |
+| `JSONArray()`                                         |  3500 |   769 |        23 |        222 |
+| `NDJSONWith(fastjson.AppendObject)`                   |   910 | **0** |     **0** |        222 |
+| `JSONArrayWith(fastjson.AppendObject)`                |   880 | **0** |     **0** |        222 |
+| `MsgPack(msgpack.Marshal)` — `vmihailenco/msgpack/v5` |  1030 |   496 |         4 |    **165** |
+
+And the same choice measured where you actually pay for it, one whole
+`logger.Info` call on a dry-run client — attribute tree, `Converter`, encode and
+the queue hand-off:
+
+| Encoder                                | ns/op | B/op    | allocs/op |
+|----------------------------------------|------:|--------:|----------:|
+| `NDJSON()`                             |  6500 | 2.6 KiB |        39 |
+| `JSONArray()`                          |  6900 | 2.6 KiB |        40 |
+| `NDJSONWith(fastjson.AppendObject)`    |  4300 | 2.2 KiB |        21 |
+| `JSONArrayWith(fastjson.AppendObject)` |  4200 | 2.2 KiB |        21 |
+| `MsgPack` — `vmihailenco/msgpack/v5`   |  3600 | 2.3 KiB |        20 |
+
+Three things to read off them:
+
+- **The framing is free; the encoding is not.** NDJSON and JSONArray differ by
+  one byte per record and nothing measurable, because both hand the record to
+  the same `ObjectAppender`. Choose the framing your receiver wants, and treat
+  the appender as the performance decision.
+- **`fastjson` produces the same bytes.** A batch encoded with it is byte-for-byte
+  what `encoding/json` produces for this payload shape — same key order, same
+  size — for a quarter of the time and none of the allocations. That is asserted
+  in the suite, not just observed here.
+- **MessagePack is smaller per record and larger per request.** 165 bytes against
+  222 uncompressed, but bodies are gzipped: a batch of 100 records that vary in
+  their values is 22.8 KB of NDJSON compressing to **1.67 KB**, against 17.1 KB
+  of MessagePack compressing to **2.24 KB**. Every record in a batch repeats the
+  same key sequence, and that is the compressor's biggest back-reference source.
+
+Timings on a laptop swing about ±20% between runs, so they are rounded; the
+allocation and byte columns are exact and did not vary, and the ordering held in
+every run.
+
+The `encoding/json` rows are the ones that move with the toolchain. On go1.27,
+where the v2 engine lands under the v1 API, the same record encodes in 13
+allocations and 200 B rather than 23 and 769, and a whole log call costs 29
+allocations rather than 39. The reflection-free appender still allocates nothing
+and still encodes in about a third of the time, so the choice does not change —
+but it is worth re-running the numbers on your own toolchain before acting on
+them.
+
 ### Faster JSON, if you log a lot
 
 Records are encoded by `encoding/json`, on the goroutine that called the logger.
@@ -214,16 +268,17 @@ import "github.com/prochac/logs-client-go/fastjson"
 betterstack.WithEncoder(betterstack.NDJSONWith(fastjson.AppendObject))
 ```
 
-Measured on Go 1.27 with the default record shape, encoding a record goes from
-1617 ns and 9 allocations to **263 ns and none**, which takes a whole
-`logger.Info` call from 3525 ns and 21 allocations to 2295 ns and 16.
+It encodes the record in about a quarter of the time and allocates nothing at
+all — see the table above — and the body it produces is byte-for-byte what
+`encoding/json` produces, keys in the same order.
 
 It is a separate package on purpose. It is a second implementation of a format
 the standard library already implements, and it is not something you should have
 to trust because you imported the client — so a binary that does not import it
 does not contain it. Read [its documentation](https://pkg.go.dev/github.com/prochac/logs-client-go/fastjson)
-before adopting it; the one visible difference is that object keys are not
-sorted.
+before adopting it: it is a type switch over the types the handler produces,
+with anything else falling through to `encoding/json`, so it can be incomplete
+without being wrong.
 
 Anything else that satisfies `ObjectAppender` works too, but note that a general
 -purpose JSON library is unlikely to help: they win by caching reflection over
@@ -237,10 +292,15 @@ concrete struct types, and a `map[string]any` gives them nothing to cache.
 Most libraries' `Marshal` can be handed over directly:
 
 ```go
-import "github.com/shamaton/msgpack/v2"       // or vmihailenco/msgpack/v5
+import "github.com/vmihailenco/msgpack/v5"
 
 betterstack.WithEncoder(betterstack.MsgPack(msgpack.Marshal))
 ```
+
+`vmihailenco/msgpack/v5`, `shamaton/msgpack/v3`, `ugorji/go/codec` and
+`hashicorp/go-msgpack/v2` all work here. `vmihailenco/msgpack/v5` is the
+fastest of them on a `map[string]any` — 4 allocations per record where
+`shamaton` takes 30 — and is the one the numbers above use.
 
 One built around a reusable handle needs a closure:
 
@@ -264,10 +324,11 @@ framing, which is a length prefix rather than a serialiser, so it stays
 dependency-free.
 
 **Do not switch expecting smaller requests.** Bodies are gzipped by default, and
-gzipped MessagePack is usually no smaller than gzipped JSON — sometimes larger,
-because JSON's repeated keys and ASCII digits compress extremely well. The
-reasons to choose it are exact `int64`/`uint64`, native binary, the timestamp
-extension type, and matching what the Node client sends.
+gzipped MessagePack is usually no smaller than gzipped JSON — on the batch
+measured above it was **34% larger**, because JSON's repeated keys and ASCII
+digits compress extremely well. The reasons to choose it are exact
+`int64`/`uint64`, native binary, the timestamp extension type, and matching what
+the Node client sends.
 
 ## Extra fields and filtering
 
