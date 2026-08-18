@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -377,4 +378,50 @@ func BenchmarkFlush(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkSourceValue measures WithAddSource's per-record symbolization, and
+// its control: the same work with the PC cache bypassed. The gap is what the
+// cache is for, and it is smaller than the whole of WithAddSource's overhead —
+// most of that is the map and the boxing, which every record must pay.
+func BenchmarkSourceValue(b *testing.B) {
+	var pcs [1]uintptr
+	runtime.Callers(1, pcs[:])
+	pc := pcs[0]
+
+	var sink map[string]any
+
+	b.Run("cached", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			sink, _ = sourceValue(pc)
+		}
+		_ = sink
+	})
+
+	// The pathological case the generations exist for: a working set larger than
+	// a generation, so every lookup misses and something is evicted. This is the
+	// cost of the cache machinery alone — no symbolization — because a program
+	// like that pays the 195 ns above on top of it either way.
+	b.Run("churn", func(b *testing.B) {
+		c := newSourceCache(1024)
+		s := callSite{function: "fn", file: "f.go", line: 1}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			c.remember(uintptr(0x400000+i*16), s)
+		}
+	})
+
+	b.Run("symbolized", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			f, _ := runtime.CallersFrames([]uintptr{pc}).Next()
+			sink = map[string]any{"function": f.Function, "file": f.File, "line": f.Line}
+		}
+		_ = sink
+	})
 }

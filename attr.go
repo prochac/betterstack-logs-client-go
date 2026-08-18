@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime"
+	"sync"
+	"sync/atomic"
 )
 
 // This file implements the attribute half of the log/slog Handler contract. It
@@ -271,6 +273,145 @@ func errorValue(err error) map[string]any {
 	}
 }
 
+// callSite is one symbolized program counter: the three fields the payload
+// needs, without the rest of a runtime.Frame.
+type callSite struct {
+	function string
+	file     string
+	line     int
+}
+
+// sourceCache memoizes symbolization by program counter.
+//
+// runtime.CallersFrames is what WithAddSource costs — it walks the pclntab and
+// allocates both the Frames and the []uintptr behind it — and it answers the
+// same question every time, because a program logs from the same call sites
+// over and over. Only the resolved triple is cached. The map handed to the tree
+// is built fresh per record on purpose: it lands in the payload, where a
+// ReplaceAttr or a custom Converter may legally mutate it.
+//
+// Eviction is two-generation second chance, not a true LRU, and the reason is
+// the hot path. A strict LRU has to mutate shared order state — a list, or a
+// per-entry timestamp — on every *hit*, which means a lock or a contended
+// atomic write on every log call in the process: more than the ~180 ns a hit
+// saves, and a point every logging goroutine serialises on. So recency is kept
+// at generation granularity instead. Lookups read the hot generation; a hit in
+// cold is carried back into hot on the way out. When hot fills — max *newly
+// discovered* call sites — it becomes cold and the previous cold is dropped
+// whole. The guarantee that buys is the one that matters: **a call site used at
+// least once in the time it takes the process to meet max new ones is never
+// evicted**, however long it has been cached and however much has been cached
+// since. A site that has genuinely fallen out of use costs one re-symbolization
+// if it comes back.
+//
+// The ceiling is therefore 2*max live entries — a full hot generation plus a
+// full cold one — which at a measured ~156 B per entry is ~2.5 MB at max=8192,
+// and a few tens of KB for the few hundred call sites a normal program has.
+// Entries are cheap because Frame.Function and Frame.File point into the
+// binary's own tables; the cache copies no string data.
+//
+// max is a field rather than a constant so the tests can reach the full state,
+// and the rotation, cheaply — the same kind of seam as the limiter's clock.
+type sourceCache struct {
+	max int64
+
+	hot  atomic.Pointer[sync.Map] // uintptr -> callSite, the generation being filled
+	cold atomic.Pointer[sync.Map] // the previous generation, still readable
+	n    atomic.Int64             // call sites newly discovered since the last rotation
+
+	rotating sync.Mutex // serialises rotation, and nothing on the lookup path
+}
+
+// maxCachedSources is a generation's size, so up to twice this many call sites
+// are held. A program with more distinct logging call sites than that still
+// works, and degrades gently: it rotates more often, and what it keeps is
+// whatever it is actually logging from.
+const maxCachedSources = 8192
+
+var sources = newSourceCache(maxCachedSources)
+
+func newSourceCache(perGeneration int64) *sourceCache {
+	c := &sourceCache{max: perGeneration}
+	c.hot.Store(&sync.Map{})
+	return c
+}
+
+// lookup symbolizes pc, through the cache.
+//
+// It reports false for a program counter that resolves to nothing, and does not
+// cache that: an unresolvable PC comes from a hand-built Record or a stripped
+// binary, and caching one would let a stream of junk churn the generations.
+func (c *sourceCache) lookup(pc uintptr) (callSite, bool) {
+	if v, ok := c.hot.Load().Load(pc); ok {
+		return v.(callSite), true
+	}
+	if cold := c.cold.Load(); cold != nil {
+		if v, ok := cold.Load(pc); ok {
+			site := v.(callSite)
+			// Used in this generation, so it must survive the next rotation.
+			c.promote(pc, site, cold)
+			return site, true
+		}
+	}
+
+	f, _ := runtime.CallersFrames([]uintptr{pc}).Next()
+	if f.File == "" && f.Function == "" && f.Line == 0 {
+		return callSite{}, false
+	}
+	site := callSite{function: f.Function, file: f.File, line: f.Line}
+	c.remember(pc, site)
+	return site, true
+}
+
+// remember records a newly discovered call site in the hot generation, and
+// rotates when that generation is full.
+func (c *sourceCache) remember(pc uintptr, site callSite) {
+	hot := c.hot.Load()
+	if _, loaded := hot.LoadOrStore(pc, site); loaded {
+		return
+	}
+	if c.n.Add(1) >= c.max {
+		c.rotate(hot)
+	}
+}
+
+// promote carries a site that is still in use out of the retiring generation,
+// so that it survives the next rotation.
+//
+// It deliberately does not count against the generation: n measures call sites
+// newly *discovered*, not ones carried over. Counting them was the first cut,
+// and it made the guarantee false — a site touched once per generation could
+// have its own promotion fill the generation, rotate, and then be dropped by
+// the next one, which is exactly the case the caller thinks it is protected
+// from. TestSourceCache/a_site_used_every_generation_is_never_evicted fails
+// against that version.
+//
+// Deleting from cold is what keeps the ceiling at 2*max: without it a promoted
+// site is held in both generations at once.
+func (c *sourceCache) promote(pc uintptr, site callSite, cold *sync.Map) {
+	c.hot.Load().LoadOrStore(pc, site)
+	cold.Delete(pc)
+}
+
+// rotate retires the full generation and starts an empty one.
+//
+// A store racing a rotation can land in the generation being retired, which
+// costs that call site nothing worse than an earlier eviction, and the count
+// can drift by the number of goroutines racing here — both are why the
+// generation boundary is approximate by design rather than by accident.
+func (c *sourceCache) rotate(full *sync.Map) {
+	c.rotating.Lock()
+	defer c.rotating.Unlock()
+
+	// Another goroutine already retired this generation.
+	if c.hot.Load() != full {
+		return
+	}
+	c.cold.Store(full)
+	c.hot.Store(&sync.Map{})
+	c.n.Store(0)
+}
+
 // sourceValue resolves a Record's program counter to a call site.
 //
 // It reports false for a zero PC, which the contract requires be ignored, and
@@ -280,14 +421,14 @@ func sourceValue(pc uintptr) (map[string]any, bool) {
 	if pc == 0 {
 		return nil, false
 	}
-	f, _ := runtime.CallersFrames([]uintptr{pc}).Next()
-	if f.File == "" && f.Function == "" && f.Line == 0 {
+	site, ok := sources.lookup(pc)
+	if !ok {
 		return nil, false
 	}
 	return map[string]any{
-		"function": f.Function,
-		"file":     f.File,
-		"line":     f.Line,
+		"function": site.function,
+		"file":     site.file,
+		"line":     site.line,
 	}, true
 }
 
