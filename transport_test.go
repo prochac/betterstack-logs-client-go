@@ -838,3 +838,124 @@ func TestShutdownCancelsInFlightUploads(t *testing.T) {
 		t.Errorf("Close took %v; in-flight uploads were not cancelled", elapsed)
 	}
 }
+
+// The upload constants are built once, at construction, and every one of them
+// has to survive the move out of do.
+func TestNewHeaders(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		opts []ClientOption
+		want map[string]string
+	}{
+		{
+			name: "defaults",
+			want: map[string]string{
+				"Authorization":    "Bearer " + testToken,
+				"Content-Type":     "application/x-ndjson",
+				"Content-Encoding": "gzip",
+			},
+		},
+		{
+			name: "compression off drops Content-Encoding",
+			opts: []ClientOption{WithCompression(CompressionNone)},
+			want: map[string]string{
+				"Authorization":    "Bearer " + testToken,
+				"Content-Type":     "application/x-ndjson",
+				"Content-Encoding": "",
+			},
+		},
+		{
+			// The content type travels with the encoder, so caching it must
+			// still ask the encoder that was configured.
+			name: "the encoder's content type",
+			opts: []ClientOption{WithEncoder(JSONArray())},
+			want: map[string]string{"Content-Type": "application/json"},
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc // the module floor is go1.21
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := clientConfig{
+				sourceToken: testToken,
+				encoder:     NDJSON(),
+				compression: CompressionGzip,
+			}
+			for _, opt := range tc.opts {
+				opt(&cfg)
+			}
+
+			h := newHeaders(&cfg)
+			for k, want := range tc.want {
+				if got := h.Get(k); got != want {
+					t.Errorf("%s = %q, want %q", k, got, want)
+				}
+			}
+			if got := h.Get("User-Agent"); got != userAgent() {
+				t.Errorf("User-Agent = %q, want %q", got, userAgent())
+			}
+			// do hands these very slices to every request in flight, so an
+			// Append by a caller's middleware must be forced to allocate one of
+			// its own. A slice with spare capacity would have it write into the
+			// array all the other requests are reading.
+			for k, v := range h {
+				if len(v) != cap(v) {
+					t.Errorf("%s has spare capacity: len %d, cap %d", k, len(v), cap(v))
+				}
+			}
+		})
+	}
+}
+
+// do copies the prebuilt header values into each request rather than setting
+// them, so every request in flight shares one []string per header. That is only
+// sound while nothing appends to them: a RoundTripper adding a header of its
+// own must grow a slice of its own, and the template must come out of a run of
+// uploads exactly as it went in.
+func TestPrebuiltHeadersAreNotWrittenIntoByMiddleware(t *testing.T) {
+	t.Parallel()
+
+	const uploads = 3
+	rec := newRecorder(t)
+	hc := &http.Client{Transport: adder{http.DefaultTransport}}
+	c, err := NewClient(testToken,
+		WithEndpoint(rec.endpoint()),
+		WithBatchInterval(time.Hour),
+		WithBatchSize(1),
+		WithHTTPClient(hc),
+	)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer c.Close()
+
+	enqueueN(t, c, uploads)
+	if err := c.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	rec.waitForRequests(t, uploads)
+	for i, req := range rec.all() {
+		// Ours plus the middleware's one, on every request. A shared slice with
+		// spare capacity would carry the previous request's addition forward.
+		if got := len(req.header.Values("Authorization")); got != 2 {
+			t.Errorf("request %d carried %d Authorization values, want 2: %q",
+				i, got, req.header.Values("Authorization"))
+		}
+	}
+	if got := c.headers.Values("Authorization"); len(got) != 1 || got[0] != "Bearer "+testToken {
+		t.Errorf("the header template was modified: Authorization = %q", got)
+	}
+}
+
+// adder is a RoundTripper that appends to a header the client set itself.
+type adder struct{ rt http.RoundTripper }
+
+func (a adder) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Add("Authorization", "middleware")
+	return a.rt.RoundTrip(req)
+}

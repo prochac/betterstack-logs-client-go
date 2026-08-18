@@ -20,6 +20,10 @@ type Encoder interface {
 	// ContentType is the value for the Content-Type request header. It travels
 	// with the encoder so that adding a format does not also require a matching
 	// change at the call site.
+	//
+	// It is asked once, when the client is built and not per request, so it
+	// must answer the same way for the life of the encoder — the same
+	// undertaking FrameIsIdentity asks for.
 	ContentType() string
 
 	// AppendRecord encodes v and appends it to dst, returning the extended

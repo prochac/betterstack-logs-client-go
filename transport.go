@@ -68,6 +68,26 @@ func newTransport(cfg *clientConfig) *http.Transport {
 	}
 }
 
+// newHeaders builds the request headers that are identical on every upload, so
+// that do assembles a request instead of rebuilding them per attempt. All four
+// are fixed for the life of the client: the token and the compression setting
+// are configuration, the User-Agent is memoised, and an Encoder's content type
+// travels with the encoder — asked once here, as FrameIsIdentity is asked once
+// when the packer is built.
+//
+// Built with Set rather than by assigning the map directly, so the keys are
+// canonicalised exactly once and do can copy them straight in.
+func newHeaders(cfg *clientConfig) http.Header {
+	h := make(http.Header, 4)
+	h.Set("Authorization", "Bearer "+cfg.sourceToken)
+	h.Set("Content-Type", cfg.encoder.ContentType())
+	h.Set("User-Agent", userAgent())
+	if cfg.compression == CompressionGzip {
+		h.Set("Content-Encoding", "gzip")
+	}
+	return h
+}
+
 // worker is one upload goroutine's private state.
 //
 // It exists for the packer. Splitting a batch after a 413 means framing and
@@ -241,16 +261,25 @@ func (c *Client) do(ctx context.Context, b *batch) (status int, retryAfter time.
 	defer cancel()
 
 	// bytes.NewReader rather than bytes.NewBuffer, so ContentLength and GetBody
-	// are populated and the body survives a redirect.
+	// are populated and the body survives a redirect. A fresh reader per
+	// attempt, and not one reader reset and reused: net/http writes the request
+	// from a goroutine of its own, so a server that answers before reading the
+	// body — which is exactly what a 413 is — can leave that write in progress
+	// after do has returned. The same constraint keeps a batch's body out of
+	// batchBufPool.
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.cfg.endpoint, bytes.NewReader(b.body))
 	if err != nil {
 		return 0, 0, "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.cfg.sourceToken)
-	req.Header.Set("Content-Type", c.cfg.encoder.ContentType())
-	req.Header.Set("User-Agent", c.userAgent)
-	if c.cfg.compression == CompressionGzip {
-		req.Header.Set("Content-Encoding", "gzip")
+	// The headers are prebuilt by newHeaders and copied into the map
+	// NewRequestWithContext has already allocated. Set would canonicalise the
+	// key and allocate a fresh one-element []string per header per attempt.
+	// The value slices are shared with every other request in flight and stay
+	// read-only: a RoundTripper must not modify the request it is given, and
+	// one that adds a header of its own goes through Set or Add, which replace
+	// the entry or grow a full slice rather than write into ours.
+	for k, v := range c.headers {
+		req.Header[k] = v
 	}
 
 	resp, err := c.hc.Do(req)

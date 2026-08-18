@@ -466,7 +466,7 @@ type Client struct {
 	hc            *http.Client
 	transport     *http.Transport // nil when the caller supplied the client
 	ownsTransport bool
-	userAgent     string
+	headers       http.Header // the per-upload constants, built once
 
 	queue  chan *[]byte   // invariant 1: never closed
 	flushC chan *flushReq // invariants 1 and 2: unbuffered, never closed
@@ -545,7 +545,7 @@ func NewClient(sourceToken string, opts ...ClientOption) (*Client, error) {
 
 	c := &Client{
 		cfg:        cfg,
-		userAgent:  userAgent(),
+		headers:    newHeaders(&cfg),
 		queue:      make(chan *[]byte, cfg.maxQueueSize),
 		flushC:     make(chan *flushReq), // unbuffered: invariant 2
 		done:       make(chan struct{}),
