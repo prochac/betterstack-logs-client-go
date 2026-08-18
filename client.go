@@ -463,8 +463,14 @@ type Client struct {
 	ownsTransport bool
 	userAgent     string
 
-	queue  chan []byte    // invariant 1: never closed
+	queue  chan *[]byte   // invariant 1: never closed
 	flushC chan *flushReq // invariants 1 and 2: unbuffered, never closed
+
+	// recordBufs pools the buffers Enqueue encodes records into. A buffer is
+	// owned by exactly one goroutine at a time: the enqueuing goroutine until
+	// the queue send, the sender after it, and the pool in between uses —
+	// putRecordBuf is called only where nothing can still alias the bytes.
+	recordBufs sync.Pool
 
 	limiter *limiter // nil unless WithBurstProtection was given
 
@@ -528,7 +534,7 @@ func NewClient(sourceToken string, opts ...ClientOption) (*Client, error) {
 	c := &Client{
 		cfg:        cfg,
 		userAgent:  userAgent(),
-		queue:      make(chan []byte, cfg.maxQueueSize),
+		queue:      make(chan *[]byte, cfg.maxQueueSize),
 		flushC:     make(chan *flushReq), // unbuffered: invariant 2
 		done:       make(chan struct{}),
 		shutdown:   make(chan struct{}),
@@ -682,11 +688,20 @@ func (c *Client) Enqueue(event map[string]any) error {
 	}
 
 	// Encoding happens here, on the caller's goroutine. Encoding errors are
-	// therefore synchronous and returnable; byte accounting downstream is exact
-	// and free; and the queue carries []byte, so no record data is shared
-	// between goroutines and there is nothing to alias.
-	buf, err := c.cfg.encoder.AppendRecord(nil, event)
+	// therefore synchronous and returnable, and byte accounting downstream is
+	// exact and free. The destination is a pooled buffer rather than a fresh
+	// slice: the queue hands it to the sender by pointer, the sender copies
+	// the record into its batch and returns the buffer through putRecordBuf,
+	// and every path below where the record does not reach the queue returns
+	// it here — so no two goroutines ever hold the bytes at once.
+	bufp, _ := c.recordBufs.Get().(*[]byte)
+	if bufp == nil {
+		bufp = new([]byte)
+	}
+	buf, err := c.cfg.encoder.AppendRecord((*bufp)[:0], event)
+	*bufp = buf
 	if err != nil {
+		c.putRecordBuf(bufp)
 		return fmt.Errorf("betterstack: encoding record: %w", err)
 	}
 
@@ -707,19 +722,38 @@ func (c *Client) Enqueue(event map[string]any) error {
 	// that the server's 413.
 	if c.cfg.compression == CompressionNone && len(buf) > hardMaxRequestBytes {
 		c.stats.droppedOversize.Add(1)
+		c.putRecordBuf(bufp) // a formality: a record this size fails the cap check
 		return nil
 	}
 
 	select {
-	case c.queue <- buf:
+	case c.queue <- bufp:
 		return nil
 	default:
 		// Deliberately no <-c.done case here: with a default branch present,
 		// both would be ready once done is closed and the choice would be
 		// random. The check at the top of the function is the gate.
 		c.stats.droppedQueueFull.Add(1)
+		c.putRecordBuf(bufp)
 		return nil
 	}
+}
+
+// maxPooledRecordBuffer is the record-buffer counterpart of
+// maxPooledJSONBuffer, and exists for the same reason: a slice only grows, so
+// one huge record would otherwise pin its capacity in the pool for the life of
+// the client (REVIEW §7).
+const maxPooledRecordBuffer = 64 << 10
+
+// putRecordBuf returns a record's encode buffer to the pool, or lets an
+// oversized one go to the collector. It must only be called once nothing can
+// still alias the bytes: Enqueue calls it on every path where the record does
+// not reach the queue, and the sender after copying the record into its batch.
+func (c *Client) putRecordBuf(p *[]byte) {
+	if cap(*p) > maxPooledRecordBuffer {
+		return
+	}
+	c.recordBufs.Put(p)
 }
 
 // Flush delivers everything enqueued before the call and waits for it to be

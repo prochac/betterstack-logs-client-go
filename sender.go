@@ -105,7 +105,8 @@ func (s *sender) run() {
 	for {
 		select {
 		case rec := <-s.c.queue:
-			s.appendRecord(rec)
+			s.appendRecord(*rec)
+			s.c.putRecordBuf(rec) // appendRecord copied; nothing aliases it now
 			if s.full() {
 				s.disarm()
 				s.flush(s.c.workerCtx)
@@ -169,7 +170,8 @@ func (s *sender) drain(ctx context.Context) {
 	for {
 		select {
 		case rec := <-s.c.queue:
-			s.appendRecord(rec)
+			s.appendRecord(*rec)
+			s.c.putRecordBuf(rec) // appendRecord copied; nothing aliases it now
 			if s.full() {
 				s.flush(ctx)
 			}
