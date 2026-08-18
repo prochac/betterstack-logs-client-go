@@ -742,7 +742,7 @@ func (c *Client) Enqueue(event map[string]any) error {
 // maxPooledRecordBuffer is the record-buffer counterpart of
 // maxPooledJSONBuffer, and exists for the same reason: a slice only grows, so
 // one huge record would otherwise pin its capacity in the pool for the life of
-// the client (REVIEW §7).
+// the client.
 const maxPooledRecordBuffer = 64 << 10
 
 // putRecordBuf returns a record's encode buffer to the pool, or lets an

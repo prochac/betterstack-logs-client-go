@@ -316,8 +316,8 @@ func BenchmarkCompress(b *testing.B) {
 // and the same bytes, so the pair differs by exactly that copy.
 //
 // The gzip numbers are the honest ones to read first — the copy is a few percent
-// of the compression pass that follows it, which is why this was a note in
-// REVIEW §7 for a long time. What the fast path is really worth is the buffer
+// of the compression pass that follows it, which is why removing it went
+// unprioritised for a long time. What the fast path is really worth is the buffer
 // itself: it is never allocated, so the default configuration holds one
 // MaxBatchBytes-sized buffer fewer for the life of the client.
 func BenchmarkPack(b *testing.B) {
