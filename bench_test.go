@@ -178,6 +178,35 @@ func BenchmarkHandleConvertWithAttrs(b *testing.B) {
 	}
 }
 
+// Ten attributes is past the point where a map built with no size hint has to
+// rehash, which is what treeSize exists to avoid.
+func BenchmarkHandleConvertManyAttrs(b *testing.B) {
+	logger := slog.New(newHandler(discardSink{}))
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		logger.Info("a log message",
+			"method", "GET", "path", "/v1/things", "status", 200, "bytes", 4096,
+			"duration", "12ms", "tenant", "acme", "region", "eu-central-1",
+			"release", "v1.0.0", "host", "web-1", "index", i)
+	}
+}
+
+// Extra fields are on every record by construction, so their conversion is the
+// clearest case for hoisting it out of the per-record path.
+func BenchmarkHandleConvertExtraFields(b *testing.B) {
+	logger := slog.New(newHandler(discardSink{}, WithExtraFields(map[string]any{
+		"service": "api", "env": "production", "region": "eu-central-1",
+	})))
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		logger.Info("a log message", "index", i)
+	}
+}
+
 // BenchmarkStdlibJSONHandler is the yardstick for the two above, and the only
 // benchmark here that measures none of this package's code.
 //

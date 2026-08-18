@@ -36,6 +36,39 @@ type handlerConfig struct {
 	filter          func(context.Context, slog.Record) bool
 	converter       Converter
 	contextKey      string
+
+	// extraFields, split once by prepareExtraFields into the values that could
+	// be converted ahead of time and the attrs that must be built per record.
+	extraStatic  map[string]any
+	extraDynamic []slog.Attr
+}
+
+// prepareExtraFields converts what it can of WithExtraFields ahead of the
+// records that carry it, the same hoist and for the same reason as preAttr:
+// extra fields are, by construction, on every record the handler produces, and
+// a string value costs one allocation per record to box otherwise.
+//
+// Nothing is hoisted when a ReplaceAttr is installed — it is entitled to see
+// every attribute of every record — and nothing is hoisted for a value whose
+// conversion is not static: a LogValuer must be resolved per record, and an
+// error becomes a map, which the payload's owner may mutate.
+//
+// It runs after every option has been applied, because WithExtraFields and
+// WithReplaceAttr may arrive in either order.
+func (c *handlerConfig) prepareExtraFields() {
+	for k, v := range c.extraFields {
+		a := slog.Any(k, v)
+		if c.replaceAttr == nil && k != "" {
+			if converted, ok := staticValue(a.Value); ok {
+				if c.extraStatic == nil {
+					c.extraStatic = make(map[string]any, len(c.extraFields))
+				}
+				c.extraStatic[k] = converted
+				continue
+			}
+		}
+		c.extraDynamic = append(c.extraDynamic, a)
+	}
 }
 
 // HandlerOption configures a Handler.
@@ -190,6 +223,7 @@ func newHandler(sink enqueuer, opts ...HandlerOption) *Handler {
 			opt(&cfg)
 		}
 	}
+	cfg.prepareExtraFields()
 	return &Handler{client: sink, cfg: cfg}
 }
 
@@ -219,7 +253,11 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 		return nil
 	}
 
-	b := treeBuilder{replace: h.cfg.replaceAttr}
+	b := treeBuilder{
+		replace:      h.cfg.replaceAttr,
+		extraStatic:  h.cfg.extraStatic,
+		extraDynamic: h.cfg.extraDynamic,
+	}
 
 	var source map[string]any
 	if h.cfg.addSource {
@@ -228,7 +266,7 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 		}
 	}
 
-	attrs := b.build(h.goas, attrsFromContext(ctx, h.cfg.attrFromContext), &r, source, h.cfg.extraFields)
+	attrs := b.build(h.goas, attrsFromContext(ctx, h.cfg.attrFromContext), &r, source)
 
 	// A nil converter means DefaultConverter, and the default has to be called
 	// directly from here. h.cfg.converter is a function value, so the compiler
@@ -271,7 +309,15 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	// that slog may reuse, so copy rather than retain.
 	owned := make([]slog.Attr, len(attrs))
 	copy(owned, attrs)
-	return h.withGroupOrAttrs(groupOrAttrs{attrs: owned})
+
+	goa := groupOrAttrs{attrs: owned}
+	// Convert now what cannot change between records. Only safe with no
+	// ReplaceAttr, which is entitled to see every attribute of every record;
+	// see preAttr.
+	if h.cfg.replaceAttr == nil {
+		goa.pre = preResolve(owned)
+	}
+	return h.withGroupOrAttrs(goa)
 }
 
 // WithGroup returns a handler that qualifies all subsequent attributes with

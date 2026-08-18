@@ -37,12 +37,73 @@ import (
 type groupOrAttrs struct {
 	group string      // non-empty => a WithGroup
 	attrs []slog.Attr // non-nil  => a WithAttrs
+	pre   []preAttr   // attrs, converted ahead of time; nil => convert per record
+}
+
+// preAttr is one accumulated attribute, converted as far ahead of the records
+// it will appear in as its kind allows.
+//
+// The point is that a With(...) chain is walked on every single record, and for
+// the overwhelmingly common attribute — a string, a number, a bool — that walk
+// re-does work whose answer cannot change: resolve, convert, and box the result
+// into an any, one heap allocation each, per attribute, per record. Boxing it
+// once at With time and assigning the same interface value into every record's
+// tree is indistinguishable downstream, because what staticValue returns is
+// immutable.
+//
+// What it deliberately does not do is precompute a *subtree*. The tree is a
+// mutable map that each record's own attributes merge into, so a precomputed
+// map would have to be deep-copied per record — which is the allocation being
+// avoided. A flat list of already-boxed values has no such problem: the maps
+// are still built per record, only their contents are hoisted.
+//
+// static is false for anything that must be built per record — a group, a
+// LogValuer, an error — and such an entry goes through appendAttr exactly as
+// before.
+type preAttr struct {
+	attr   slog.Attr // the original; the path taken when static is false
+	value  any       // the converted value, when static
+	static bool
+}
+
+// preResolve converts what it can of one WithAttrs call.
+//
+// It is only ever called when the handler has no ReplaceAttr: that function is
+// entitled to see every attribute of every record, and may answer differently
+// each time, so nothing can be hoisted past it. An attribute is hoisted only if
+// it would take appendAttr's plain-assignment path unchanged — a non-empty key,
+// a static kind, and therefore neither the zero Attr nor a group.
+func preResolve(attrs []slog.Attr) []preAttr {
+	out := make([]preAttr, len(attrs))
+	for i, a := range attrs {
+		out[i].attr = a
+		if a.Key == "" {
+			continue
+		}
+		// No Resolve first: Resolve is the identity on every kind staticValue
+		// accepts, and a LogValuer is not one of them.
+		if v, ok := staticValue(a.Value); ok {
+			out[i].value = v
+			out[i].static = true
+		}
+	}
+	return out
 }
 
 // treeBuilder turns a handler's accumulated state and one Record into the
 // nested map that becomes the payload's attribute tree.
 type treeBuilder struct {
 	replace func(groups []string, a slog.Attr) slog.Attr
+
+	// The two halves of WithExtraFields, split once when the handler is built:
+	// values that could be converted ahead of time, and the attrs that could
+	// not. See handlerConfig.prepareExtraFields.
+	extraStatic  map[string]any
+	extraDynamic []slog.Attr
+
+	// recordAttrs is what the record itself contributes to the innermost map,
+	// so that map can be sized for it. See treeSize.
+	recordAttrs int
 }
 
 // build assembles the attribute tree for one record.
@@ -71,7 +132,8 @@ type treeBuilder struct {
 // every JSON consumer applies, is the one that survives. Emitting both is not
 // open to us — the tree is a map, so a key appears once — so yielding is how
 // the same outcome is reached.
-func (b *treeBuilder) build(goas []groupOrAttrs, ctxAttrs []slog.Attr, r *slog.Record, source, extra map[string]any) map[string]any {
+func (b *treeBuilder) build(goas []groupOrAttrs, ctxAttrs []slog.Attr, r *slog.Record, source map[string]any) map[string]any {
+	b.recordAttrs = r.NumAttrs()
 	root := b.walk(goas, nil, func(dst map[string]any, groups []string) {
 		r.Attrs(func(a slog.Attr) bool {
 			b.appendAttr(dst, groups, a)
@@ -84,6 +146,10 @@ func (b *treeBuilder) build(goas []groupOrAttrs, ctxAttrs []slog.Attr, r *slog.R
 	// same ReplaceAttr treatment as any other attribute. The one consequence
 	// worth knowing: the taken-check runs before appendAttr, so a ReplaceAttr
 	// that renames keys can defeat it.
+	//
+	// extraStatic is the one exception, and only ever populated when there is
+	// no ReplaceAttr: those values went through the same conversion, once, when
+	// the handler was built. See preAttr.
 	if source != nil {
 		if _, taken := root[slog.SourceKey]; !taken {
 			b.appendAttr(root, nil, slog.Any(slog.SourceKey, source))
@@ -95,11 +161,17 @@ func (b *treeBuilder) build(goas []groupOrAttrs, ctxAttrs []slog.Attr, r *slog.R
 		}
 		b.appendAttr(root, nil, a)
 	}
-	for k, v := range extra {
+	for k, v := range b.extraStatic {
 		if _, taken := root[k]; taken {
 			continue
 		}
-		b.appendAttr(root, nil, slog.Any(k, v))
+		root[k] = v
+	}
+	for _, a := range b.extraDynamic {
+		if _, taken := root[a.Key]; taken {
+			continue
+		}
+		b.appendAttr(root, nil, a)
 	}
 	return root
 }
@@ -113,7 +185,7 @@ func (b *treeBuilder) build(goas []groupOrAttrs, ctxAttrs []slog.Attr, r *slog.R
 // whose contents arrive later and may never arrive at all. Because the check
 // unwinds outward, a chain of empty nested groups collapses entirely.
 func (b *treeBuilder) walk(goas []groupOrAttrs, groups []string, tail func(map[string]any, []string)) map[string]any {
-	dst := map[string]any{}
+	dst := make(map[string]any, treeSize(goas, b.recordAttrs))
 
 	for i, goa := range goas {
 		if goa.group != "" {
@@ -125,13 +197,53 @@ func (b *treeBuilder) walk(goas []groupOrAttrs, groups []string, tail func(map[s
 			}
 			return dst
 		}
-		for _, a := range goa.attrs {
-			b.appendAttr(dst, groups, a)
-		}
+		b.appendGroupOrAttrs(dst, groups, goa)
 	}
 
 	tail(dst, groups)
 	return dst
+}
+
+// treeSize is how many keys one level of the tree is about to hold: every
+// WithAttrs entry up to the first group, plus either that group or, when there
+// is none, the record's own attributes.
+//
+// It is a hint, not a bound — a ReplaceAttr may discard attributes, groups may
+// collapse, and the root takes source, context attributes and extra fields on
+// top. Getting it approximately right is what matters: a map built with no hint
+// at all rehashes once past eight keys, which for a ten-attribute record is an
+// extra allocation and half again the bytes (952 B and 5 allocations against
+// 664 B and 4). Below eight keys the hint costs and saves nothing.
+func treeSize(goas []groupOrAttrs, recordAttrs int) int {
+	n := 0
+	for _, goa := range goas {
+		if goa.group != "" {
+			return n + 1
+		}
+		n += len(goa.attrs)
+	}
+	return n + recordAttrs
+}
+
+// appendGroupOrAttrs writes the attributes of one WithAttrs call into dst,
+// taking the hoisted values where preResolve produced them.
+func (b *treeBuilder) appendGroupOrAttrs(dst map[string]any, groups []string, goa groupOrAttrs) {
+	if goa.pre == nil {
+		for _, a := range goa.attrs {
+			b.appendAttr(dst, groups, a)
+		}
+		return
+	}
+	for _, p := range goa.pre {
+		if p.static {
+			// Plain assignment, exactly as appendAttr's tail would do it: a
+			// hoisted attr has a non-empty key, is not the zero Attr and is not
+			// a group, all checked when it was hoisted.
+			dst[p.attr.Key] = p.value
+			continue
+		}
+		b.appendAttr(dst, groups, p.attr)
+	}
 }
 
 // childPath returns groups extended by one level, in an array of its own.
@@ -225,27 +337,49 @@ func (b *treeBuilder) appendAttr(dst map[string]any, groups []string, a slog.Att
 // value converts a resolved, non-group slog.Value into something the encoder
 // can marshal.
 func (b *treeBuilder) value(v slog.Value) any {
+	if out, ok := staticValue(v); ok {
+		return out
+	}
+	return anyValue(v.Any())
+}
+
+// staticValue converts the kinds whose conversion depends on nothing but the
+// value itself, and reports false for the rest.
+//
+// The split exists so that an attribute accumulated by WithAttrs or given to
+// WithExtraFields can be converted once instead of on every record: what it
+// returns is immutable, self-contained and identical each time, so one boxed
+// copy can be shared by every record that carries it. Everything it declines is
+// something that must not be hoisted — a LogValuer, whose whole purpose is to
+// be resolved late; a group, which needs a map of its own per record; and
+// KindAny, because an error becomes a fresh map (see errorValue) and because
+// conversion there is a no-op that saves nothing anyway.
+//
+// Keeping it a separate function is what keeps the two paths honest: the
+// per-record path goes through it too, so a hoisted value cannot drift from
+// the one a record would have produced.
+func staticValue(v slog.Value) (any, bool) {
 	switch v.Kind() {
 	case slog.KindString:
-		return v.String()
+		return v.String(), true
 	case slog.KindInt64:
-		return v.Int64()
+		return v.Int64(), true
 	case slog.KindUint64:
-		return v.Uint64()
+		return v.Uint64(), true
 	case slog.KindFloat64:
-		return v.Float64()
+		return v.Float64(), true
 	case slog.KindBool:
-		return v.Bool()
+		return v.Bool(), true
 	case slog.KindDuration:
 		// Durations marshal as an integer nanosecond count otherwise, which is
 		// unreadable in a log viewer.
-		return v.Duration().String()
+		return v.Duration().String(), true
 	case slog.KindTime:
 		// Round(0) strips the monotonic reading so the value marshals as a
 		// plain wall-clock timestamp.
-		return v.Time().Round(0)
+		return v.Time().Round(0), true
 	default:
-		return anyValue(v.Any())
+		return nil, false
 	}
 }
 
@@ -274,11 +408,19 @@ func errorValue(err error) map[string]any {
 }
 
 // callSite is one symbolized program counter: the three fields the payload
-// needs, without the rest of a runtime.Frame.
+// needs, without the rest of a runtime.Frame, and already boxed into the any
+// each one is assigned as.
+//
+// Boxing here rather than per record is safe where sharing the map is not. A
+// string and an int are immutable, so every record's source map may hold the
+// same three interface values; the map itself is still built fresh, because it
+// lands in the payload where a ReplaceAttr or a custom Converter may legally
+// mutate it. That takes three allocations per record off WithAddSource — more
+// than the symbolization the cache around it already saves.
 type callSite struct {
-	function string
-	file     string
-	line     int
+	function any // string, runtime.Frame.Function
+	file     any // string, runtime.Frame.File
+	line     any // int, runtime.Frame.Line
 }
 
 // sourceCache memoizes symbolization by program counter.

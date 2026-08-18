@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -430,6 +431,241 @@ type groupValuer struct{}
 
 func (groupValuer) LogValue() slog.Value {
 	return slog.GroupValue(slog.String("inner", "v"))
+}
+
+// --- conversion hoisted out of the per-record path --------------------------
+//
+// An attribute accumulated by WithAttrs, and a WithExtraFields value, appear on
+// every record the handler produces, so their conversion is done once and the
+// boxed result shared (attr.go's preAttr). These tests pin the two halves of
+// that: what is hoisted must be indistinguishable from converting per record,
+// and what must not be hoisted must not be.
+
+// countingValuer resolves to a different value every time it is asked, which is
+// how a per-record resolution is told apart from one done at With time.
+type countingValuer struct{ n *atomic.Int64 }
+
+func (c countingValuer) LogValue() slog.Value { return slog.Int64Value(c.n.Add(1)) }
+
+func TestAheadOfTimeConversion(t *testing.T) {
+	t.Parallel()
+
+	// The same table as TestValueKinds, through With instead of the record, so
+	// the hoisted path cannot drift from the per-record one.
+	t.Run("With-chain values are mapped exactly as record attrs", func(t *testing.T) {
+		t.Parallel()
+		when := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+		ctx := contextOf(t, logRecord(t, nil, func(l *slog.Logger) {
+			l.With(
+				slog.String("s", "str"),
+				slog.Int64("i", -7),
+				slog.Uint64("u", 7),
+				slog.Float64("f", 1.5),
+				slog.Bool("b", true),
+				slog.Duration("d", 1500*time.Millisecond),
+				slog.Time("t", when),
+			).Info("msg")
+		}))
+
+		want := map[string]any{"s": "str", "i": int64(-7), "u": uint64(7), "f": 1.5, "b": true, "d": "1.5s"}
+		for k, v := range want {
+			if got := ctx[k]; !reflect.DeepEqual(got, v) {
+				t.Errorf("%s = %#v, want %#v", k, got, v)
+			}
+		}
+		if got, ok := ctx["t"].(time.Time); !ok || !got.Equal(when) {
+			t.Errorf("t = %#v, want %v", ctx["t"], when)
+		}
+	})
+
+	// appendAttr drops a keyless attribute, and the hoist must not smuggle one
+	// past it: a map has nowhere to put it.
+	t.Run("a keyless With-chain attr is still dropped", func(t *testing.T) {
+		t.Parallel()
+		ctx := contextOf(t, logRecord(t, nil, func(l *slog.Logger) {
+			l.With(slog.String("", "orphan"), slog.String("k", "v")).Info("msg")
+		}))
+		if len(ctx) != 1 || ctx["k"] != "v" {
+			t.Errorf("context = %#v, want only k", ctx)
+		}
+	})
+
+	t.Run("a With-chain LogValuer is resolved per record", func(t *testing.T) {
+		t.Parallel()
+		var n atomic.Int64
+		sink := &stubSink{}
+		l := slog.New(newHandler(sink)).With("k", countingValuer{&n})
+		l.Info("first")
+		l.Info("second")
+
+		got := sink.all()
+		if len(got) != 2 {
+			t.Fatalf("got %d records, want 2", len(got))
+		}
+		first, second := contextOf(t, got[0])["k"], contextOf(t, got[1])["k"]
+		if first != int64(1) || second != int64(2) {
+			t.Errorf("k = %v then %v, want 1 then 2: the value was resolved once and reused", first, second)
+		}
+	})
+
+	t.Run("an extra field LogValuer is resolved per record", func(t *testing.T) {
+		t.Parallel()
+		var n atomic.Int64
+		sink := &stubSink{}
+		l := slog.New(newHandler(sink, WithExtraFields(map[string]any{"k": countingValuer{&n}})))
+		l.Info("first")
+		l.Info("second")
+
+		got := sink.all()
+		if len(got) != 2 {
+			t.Fatalf("got %d records, want 2", len(got))
+		}
+		first, second := contextOf(t, got[0])["k"], contextOf(t, got[1])["k"]
+		if first != int64(1) || second != int64(2) {
+			t.Errorf("k = %v then %v, want 1 then 2: the value was resolved once and reused", first, second)
+		}
+	})
+
+	// An error converts to a map, and a map in the payload belongs to whoever
+	// is handed it — a custom Converter may rewrite it. Sharing one between
+	// records would let one record's rewrite show up in the next.
+	t.Run("an extra field error keeps its own map per record", func(t *testing.T) {
+		t.Parallel()
+		sink := &stubSink{}
+		l := slog.New(newHandler(sink, WithExtraFields(map[string]any{"boom": errors.New("nope")})))
+		l.Info("first")
+		l.Info("second")
+
+		got := sink.all()
+		if len(got) != 2 {
+			t.Fatalf("got %d records, want 2", len(got))
+		}
+		first, ok := contextOf(t, got[0])["boom"].(map[string]any)
+		if !ok {
+			t.Fatalf("boom = %#v, want the error map", contextOf(t, got[0])["boom"])
+		}
+		second, ok := contextOf(t, got[1])["boom"].(map[string]any)
+		if !ok {
+			t.Fatalf("boom = %#v, want the error map", contextOf(t, got[1])["boom"])
+		}
+		first["message"] = "rewritten"
+		if second["message"] != "nope" {
+			t.Error("both records were handed the same error map")
+		}
+	})
+
+	// Nothing may be hoisted past a ReplaceAttr: it is entitled to see every
+	// attribute of every record, and may answer differently each time.
+	t.Run("ReplaceAttr still sees With-chain attrs and extra fields", func(t *testing.T) {
+		t.Parallel()
+		var n atomic.Int64
+		opts := []HandlerOption{
+			WithExtraFields(map[string]any{"env": "prod"}),
+			WithReplaceAttr(func(_ []string, a slog.Attr) slog.Attr {
+				if a.Value.Kind() == slog.KindString {
+					return slog.Int64(a.Key, n.Add(1))
+				}
+				return a
+			}),
+		}
+		sink := &stubSink{}
+		l := slog.New(newHandler(sink, opts...)).With("service", "api")
+		l.Info("first")
+		l.Info("second")
+
+		got := sink.all()
+		if len(got) != 2 {
+			t.Fatalf("got %d records, want 2", len(got))
+		}
+		for i, want := range [][2]int64{{1, 2}, {3, 4}} {
+			ctx := contextOf(t, got[i])
+			// The two keys are visited in an unspecified order, so only the
+			// pair is asserted: both went through ReplaceAttr, on this record.
+			pair := [2]int64{0, 0}
+			pair[0], _ = ctx["service"].(int64)
+			pair[1], _ = ctx["env"].(int64)
+			if pair[0]+pair[1] != want[0]+want[1] {
+				t.Errorf("record %d: service=%v env=%v, want the pair %v: a value was hoisted past ReplaceAttr",
+					i, ctx["service"], ctx["env"], want)
+			}
+		}
+	})
+
+	// WithExtraFields and WithReplaceAttr may be given in either order, so the
+	// split has to happen after every option has been applied.
+	t.Run("option order does not defeat the ReplaceAttr check", func(t *testing.T) {
+		t.Parallel()
+		replace := WithReplaceAttr(func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == "env" {
+				return slog.String("env", "replaced")
+			}
+			return a
+		})
+		for _, opts := range [][]HandlerOption{
+			{WithExtraFields(map[string]any{"env": "prod"}), replace},
+			{replace, WithExtraFields(map[string]any{"env": "prod"})},
+		} {
+			ctx := contextOf(t, logRecord(t, opts, func(l *slog.Logger) { l.Info("msg") }))
+			if ctx["env"] != "replaced" {
+				t.Errorf("env = %#v, want it to have gone through ReplaceAttr", ctx["env"])
+			}
+		}
+	})
+}
+
+// The hoist is worth having only if it is actually free per record, so this
+// measures exactly that: a handler carrying static attributes must allocate no
+// more per record than one carrying none. It compares against itself rather
+// than pinning an absolute count, which would only pin the Go version.
+func TestHoistedAttrsCostNothingPerRecord(t *testing.T) {
+	// No t.Parallel: AllocsPerRun requires the test to have the machine to
+	// itself, and panics if it does not.
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "a log message", 0)
+	r.AddAttrs(slog.String("k", "v"))
+
+	allocs := func(h slog.Handler) float64 {
+		ctx := context.Background()
+		return testing.AllocsPerRun(100, func() {
+			if err := h.Handle(ctx, r); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+		})
+	}
+
+	plain := allocs(newHandler(discardSink{}))
+
+	for _, tc := range []struct {
+		name string
+		h    slog.Handler
+	}{
+		{"WithAttrs", newHandler(discardSink{}).WithAttrs([]slog.Attr{
+			slog.String("service", "api"), slog.String("release", "v1.0.0"),
+		})},
+		{"WithExtraFields", newHandler(discardSink{}, WithExtraFields(map[string]any{
+			"service": "api", "release": "v1.0.0",
+		}))},
+	} {
+		if got := allocs(tc.h); got > plain {
+			t.Errorf("%s: %v allocations per record against %v with no attributes at all: "+
+				"the conversion is not being hoisted", tc.name, got, plain)
+		}
+	}
+}
+
+// The four standard levels are boxed once, so DefaultConverter does not
+// allocate for the level of every record. What matters is that the shortcut
+// still answers exactly what Level.String() would.
+func TestLevelValue(t *testing.T) {
+	t.Parallel()
+
+	for _, l := range []slog.Level{
+		slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError,
+		slog.LevelInfo + 2, slog.LevelWarn - 1, slog.Level(-8), slog.Level(100),
+	} {
+		if got := levelValue(l); got != l.String() {
+			t.Errorf("levelValue(%v) = %#v, want %q", l, got, l.String())
+		}
+	}
 }
 
 func TestEmptyAttrIsElided(t *testing.T) {

@@ -70,7 +70,15 @@ type Converter func(r *slog.Record, attrs map[string]any, o ConvertOptions) map[
 // interval and several retry backoffs after the event, from an unsynchronised
 // clock.
 func DefaultConverter(r *slog.Record, attrs map[string]any, o ConvertOptions) map[string]any {
-	payload := make(map[string]any, len(attrs)+3)
+	// Sized for what actually lands: dt, level, message, and either the one
+	// context key or every attribute flattened beside them. Sizing it
+	// len(attrs)+3 unconditionally over-allocated the nested case, which is the
+	// default one, by a bucket or more per record for an attribute-rich log.
+	size := 4
+	if o.ContextKey == "" {
+		size = len(attrs) + 3
+	}
+	payload := make(map[string]any, size)
 
 	if o.ContextKey == "" {
 		// Flattened: attributes go to the top level, and the reserved keys are
@@ -89,10 +97,42 @@ func DefaultConverter(r *slog.Record, attrs map[string]any, o ConvertOptions) ma
 		// accepted by the API.
 		payload[KeyTime] = r.Time.Round(0).UTC()
 	}
-	payload[KeyLevel] = r.Level.String()
+	payload[KeyLevel] = levelValue(r.Level)
 	payload[KeyMessage] = r.Message
 
 	return payload
+}
+
+// Pre-boxed level names.
+//
+// r.Level.String() returns a constant for each of the four standard levels, but
+// assigning a string to a map[string]any boxes it, and that box is one heap
+// allocation on every single record. There are four possible values in almost
+// every program, so they are boxed once here and shared: an any holding a
+// string is immutable, and nothing downstream can tell the difference.
+var (
+	levelDebug any = slog.LevelDebug.String()
+	levelInfo  any = slog.LevelInfo.String()
+	levelWarn  any = slog.LevelWarn.String()
+	levelError any = slog.LevelError.String()
+)
+
+// levelValue returns the payload value for a level, without allocating for the
+// four standard ones. A custom level between them ("INFO+2") is formatted, and
+// boxed, per record.
+func levelValue(l slog.Level) any {
+	switch l {
+	case slog.LevelDebug:
+		return levelDebug
+	case slog.LevelInfo:
+		return levelInfo
+	case slog.LevelWarn:
+		return levelWarn
+	case slog.LevelError:
+		return levelError
+	default:
+		return l.String()
+	}
 }
 
 // compile-time proof that DefaultConverter satisfies Converter.
