@@ -257,7 +257,7 @@ Unchanged by any of this: the go 1.21 floor, and the MIT notice (© 2023 Samuel 
 
 Their Go module paths are **lowercase** regardless of the org's display casing: `module github.com/betterstackhq/terraform-provider-logtail`.
 
-So the target they would land on is `github.com/betterstackhq/logs-client-go`. Build it now as **`github.com/<owner>/logs-client-go`**, package **`betterstack`** — adoption is then a one-line module-path change with every identifier and import name unchanged. Reads as `betterstack.New(...)`, `betterstack.Handler`. `logs-client-go` (language) rather than `logs-client-slog` (framework) matches the legacy language-named repos; .NET is framework-named only because it has two competing logging frameworks, whereas Go has one obvious target.
+So the target they would land on is `github.com/betterstackhq/logs-client-go`. Build it now as **`github.com/<owner>/betterstack-logs-client-go`**, package **`betterstack`** — the vendor prefix is what the org name supplies for them and a personal namespace does not, and it drops away on adoption, which is then a one-line module-path change with every identifier and import name unchanged. Reads as `betterstack.New(...)`, `betterstack.Handler`. `logs-client-go` (language) rather than `logs-client-slog` (framework) matches the legacy language-named repos; .NET is framework-named only because it has two competing logging frameworks, whereas Go has one obvious target.
 
 ### Licence
 

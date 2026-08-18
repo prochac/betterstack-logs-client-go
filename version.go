@@ -7,10 +7,12 @@ import (
 
 // modulePath must match the module directive in go.mod. It is how this module
 // finds its own entry in the importing binary's build info.
-const modulePath = "github.com/prochac/logs-client-go"
+const modulePath = "github.com/prochac/betterstack-logs-client-go"
 
 // clientName is the <lib> half of the User-Agent, matching the logtail-js(node)
-// convention (PARITY §3).
+// convention (PARITY §3). It names the client, not the repository, so it stays
+// unprefixed even though modulePath carries a "betterstack-" prefix that a
+// personal namespace needs and Better Stack's own would not.
 const clientName = "logs-client-go"
 
 // devVersion is the version reported when build info names no real one: the

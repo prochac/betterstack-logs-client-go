@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A **Better Stack logging client for Go**, built to be adopted by Better Stack as first-party rather than to live as a third-party wrapper. There is no Go client in either of their orgs (`logtail`, `BetterStackHQ`), so the slot is unclaimed — see PARITY.md §8.
 
-Module path is `github.com/prochac/logs-client-go`, package `betterstack`, mirroring their `BetterStackHQ/logs-client-<target>` convention. Adoption is then a one-line change to `github.com/betterstackhq/logs-client-go` with every identifier and import name unchanged.
+Module path is `github.com/prochac/betterstack-logs-client-go`, package `betterstack`. The tail mirrors their `BetterStackHQ/logs-client-<target>` convention; the `betterstack-` prefix is there only because a personal namespace has to name the vendor the client is *for*, and it drops away under theirs. Adoption is then a one-line change to `github.com/betterstackhq/logs-client-go` with every identifier and import name unchanged.
+
+The `User-Agent` is `logs-client-go/<version>` and deliberately does **not** track the repository name — it is the `<lib>` half of the sibling clients' convention (DESIGN §4), so `clientName` in `version.go` stays unprefixed while `modulePath` must match `go.mod` exactly.
 
 This repository is a **greenfield rewrite**, not a fork. It replaced `prochac/slog-betterstack` (itself a fork of `samber/slog-betterstack`), which is now abandoned.
 

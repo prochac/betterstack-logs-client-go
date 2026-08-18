@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	betterstack "github.com/prochac/logs-client-go"
+	betterstack "github.com/prochac/betterstack-logs-client-go"
 )
 
 func benchPayload() map[string]any {

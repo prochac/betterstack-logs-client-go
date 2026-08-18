@@ -10,7 +10,7 @@ The design of the greenfield Better Stack Go client.
 
 Greenfield rewrite, not an evolution of the fork (PARITY §8). Nothing in the current tree is carried over as source.
 
-- **Module**: `github.com/prochac/logs-client-go`, so Better Stack's adoption is a one-line path change to `github.com/betterstackhq/logs-client-go`.
+- **Module**: `github.com/prochac/betterstack-logs-client-go` — the `logs-client-go` tail of PARITY §8's convention, prefixed with the vendor because a personal namespace does not supply it. Better Stack's adoption is then a one-line path change to `github.com/betterstackhq/logs-client-go`, where the prefix is redundant and goes away.
 - **Package**: `betterstack`. Reads as `betterstack.NewClient(...)`, `betterstack.NewHandler(...)`.
 - **Licence**: ISC — Better Stack's house licence for clients — under the actual author's copyright, `Copyright (c) 2026, Tomáš Procházka`. Shipping their licence *text* is what makes adoption frictionless; asserting their copyright over code they have not accepted would be a defect their legal review has to unwind, which is precisely what greenfield exists to avoid (PARITY §8). The holder line is a one-line change on adoption.
 - **Go floor**: 1.21, matching what `log/slog` shipped in. No post-1.21 stdlib APIs.
@@ -466,7 +466,7 @@ func (c *Client) Close() error                    // Flush with ShutdownTimeout,
 ## 7. Repository layout
 
 ```
-go.mod            module github.com/prochac/logs-client-go   (go 1.21)
+go.mod            module github.com/prochac/betterstack-logs-client-go   (go 1.21)
 LICENSE           ISC, Copyright (c) 2026, Tomáš Procházka
 README.md         install, quickstart, options tables, flush-before-exit
 DESIGN.md         this file

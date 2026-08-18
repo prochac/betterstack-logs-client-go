@@ -12,7 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	betterstack "github.com/prochac/logs-client-go"
+	betterstack "github.com/prochac/betterstack-logs-client-go"
 )
 
 // This package is a second implementation of a format encoding/json already

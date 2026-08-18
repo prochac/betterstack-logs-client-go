@@ -1,4 +1,4 @@
-module github.com/prochac/logs-client-go
+module github.com/prochac/betterstack-logs-client-go
 
 go 1.21
 

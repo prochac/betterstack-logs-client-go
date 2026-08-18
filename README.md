@@ -1,4 +1,4 @@
-# logs-client-go
+# betterstack-logs-client-go
 
 A [Better Stack](https://betterstack.com/logs) logging client for Go: a
 `log/slog` handler backed by a batching, retrying HTTP client.
@@ -7,14 +7,17 @@ Standard library only — no dependencies outside it, and none planned. Go 1.21 
 newer.
 
 ```sh
-go get github.com/prochac/logs-client-go
+go get github.com/prochac/betterstack-logs-client-go
 ```
 
 ```go
-import betterstack "github.com/prochac/logs-client-go"
+import betterstack "github.com/prochac/betterstack-logs-client-go"
 ```
 
-The module path ends in `logs-client-go`; the package is named `betterstack`.
+The module path ends in `logs-client-go`, prefixed with `betterstack-` because a
+personal namespace has to say what it is a client *of*; the package is named
+`betterstack`, so import it under that name rather than the trailing path
+element.
 
 ## Quickstart
 
@@ -25,7 +28,7 @@ import (
         "log/slog"
         "os"
 
-        betterstack "github.com/prochac/logs-client-go"
+        betterstack "github.com/prochac/betterstack-logs-client-go"
 )
 
 func main() {
@@ -255,7 +258,7 @@ The `fastjson` subpackage is a reflection-free appender for exactly this payload
 shape. Opt in at the call site:
 
 ```go
-import "github.com/prochac/logs-client-go/fastjson"
+import "github.com/prochac/betterstack-logs-client-go/fastjson"
 
 betterstack.WithEncoder(betterstack.NDJSONWith(fastjson.AppendObject))
 ```
@@ -267,7 +270,7 @@ all — see the table above — and the body it produces is byte-for-byte what
 It is a separate package on purpose. It is a second implementation of a format
 the standard library already implements, and it is not something you should have
 to trust because you imported the client — so a binary that does not import it
-does not contain it. Read [its documentation](https://pkg.go.dev/github.com/prochac/logs-client-go/fastjson)
+does not contain it. Read [its documentation](https://pkg.go.dev/github.com/prochac/betterstack-logs-client-go/fastjson)
 before adopting it: it is a type switch over the types the handler produces,
 with anything else falling through to `encoding/json`, so it can be incomplete
 without being wrong.
