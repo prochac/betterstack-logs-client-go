@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"net/http"
@@ -334,6 +335,56 @@ func TestPayloadTooLargeSplitsUntilItFits(t *testing.T) {
 	}
 	if got := len(rec.accepted()); got != records {
 		t.Errorf("%d records arrived, want %d", got, records)
+	}
+}
+
+// A batch's record bytes go back to the client's pool once the batch is
+// resolved, and a batch a 413 split is not resolved until both halves are: a
+// half re-frames from the parent's bytes, so a parent recycled early hands the
+// sender's next batch the very array a split still in flight is reading. That
+// is invisible in a single flush — it needs the pool churning while splits run,
+// which is what many small batches against a size-limited server produce.
+func TestSplitHalvesKeepTheirParentsRecordBytes(t *testing.T) {
+	t.Parallel()
+
+	const records = 400
+
+	probe, err := NDJSON().AppendRecord(nil, event(0))
+	if err != nil {
+		t.Fatalf("sizing a record: %v", err)
+	}
+	// Three records to a request against batches of eight, so every batch is
+	// refused and halved twice before its pieces fit.
+	rec := newRecorder(t, withMaxAcceptedBytes(len(probe)*3))
+	c, errs := newTestClient(t, rec, WithBatchSize(8), WithCompression(CompressionNone))
+	defer c.Close()
+
+	enqueueN(t, c, records)
+	if err := c.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	if got := c.Stats().Sent; got != records {
+		t.Errorf("Stats().Sent = %d, want %d", got, records)
+	}
+	if got := errs.len(); got != 0 {
+		t.Errorf("OnError fired %d times for recovered 413s: %v", got, errs.all())
+	}
+
+	// Every record exactly once, and with its own message: a half framed from
+	// a recycled buffer carries some other batch's records, not garbage.
+	seen := map[string]int{}
+	for _, m := range rec.accepted() {
+		msg, _ := m[KeyMessage].(string)
+		seen[msg]++
+	}
+	if len(seen) != records {
+		t.Errorf("got %d distinct records, want %d", len(seen), records)
+	}
+	for i := 0; i < records; i++ {
+		if n := seen[fmt.Sprintf("record-%d", i)]; n != 1 {
+			t.Errorf("record-%d delivered %d times, want 1", i, n)
+		}
 	}
 }
 

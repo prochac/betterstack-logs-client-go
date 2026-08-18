@@ -607,6 +607,41 @@ func (e *lineEncoder) Frame(batch []byte, n int) []byte {
 
 func (e *lineEncoder) frames() int64 { return e.n.Load() }
 
+// --- the batch buffer pool --------------------------------------------------
+
+// A batch's record buffer only ever grows, and the sender checks a batch for
+// fullness only after appending a record — so one outsized record leaves that
+// batch over MaxBatchBytes, and pooling it would pin that capacity for the life
+// of the client. Ordinary traffic is inside the cap by construction, since a
+// batch is at most MaxBatchBytes plus the record that crossed it.
+//
+// The assertion is one-sided, like the JSON encoder pool's: a pool that answers
+// with nothing passes, so this can only fail when the oversized set really was
+// retained.
+func TestOversizedBatchBuffersAreNotPooled(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, _ := newTestClient(t, rec, WithMaxBatchBytes(1<<10))
+	defer c.Close()
+
+	limit := 2 * c.cfg.maxBatchBytes
+	c.putBatchBufs(&batchBufs{raw: make([]byte, 0, 4*limit)})
+
+	// Drain rather than Get once: a pool holds per-P private and shared slots
+	// and nothing promises which one answers first.
+	for i := 0; i < 16; i++ {
+		bufs, _ := c.batchBufPool.Get().(*batchBufs)
+		if bufs == nil {
+			continue
+		}
+		if got := cap(bufs.raw); got > limit {
+			t.Fatalf("pooled batch buffer has capacity %d, over the %d cap: "+
+				"one outsized record inflates the pool permanently", got, limit)
+		}
+	}
+}
+
 // --- burst protection -------------------------------------------------------
 
 // A window of an hour makes the limit a plain count for the duration of the

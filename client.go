@@ -225,8 +225,11 @@ func WithBatchInterval(d time.Duration) ClientOption {
 // accumulation buffer and the gzip output buffer each grow to about this size
 // over the client's life and are then kept, deliberately: they are the working
 // set of every batch, so releasing them would buy an allocation per flush
-// forever. A framing buffer used to be a third — an encoder that implements
-// IdentityFramer, as the default one does, no longer needs it at all.
+// forever. The copy of it that every batch carries is pooled for the same
+// reason, which is what makes the worst case above a working set held between
+// flushes rather than one churned through the collector. A framing buffer used
+// to be a third — an encoder that implements IdentityFramer, as the default one
+// does, no longer needs it at all.
 func WithMaxBatchBytes(n int) ClientOption {
 	return func(c *clientConfig) { c.maxBatchBytes = n }
 }
@@ -473,6 +476,13 @@ type Client struct {
 	// the queue send, the sender after it, and the pool in between uses —
 	// putRecordBuf is called only where nothing can still alias the bytes.
 	recordBufs sync.Pool
+
+	// batchBufPool pools the record bytes and boundaries a completed batch
+	// takes off the sender — recordBufs one level up. Ownership crosses
+	// goroutines here rather than staying on one: the sender takes a set at
+	// flush time, and whoever resolves the batch returns it, which is an upload
+	// worker for every batch that reaches one.
+	batchBufPool sync.Pool
 
 	limiter *limiter // nil unless WithBurstProtection was given
 
@@ -886,6 +896,73 @@ type batch struct {
 	// parent is discarded at that point and nothing ever writes into raw.
 	raw    []byte
 	bounds []int
+
+	// bufs is the pooled set raw and bounds were taken from, or nil for a batch
+	// that owns neither: every batch produced by a split aliases its parent's.
+	// See releaseBatch.
+	bufs *batchBufs
+}
+
+// batchBufs is the buffer set a batch holds for as long as it is in flight: the
+// copy of the sender's accumulation buffer, and the record boundaries within
+// it. The two are pooled as a pair because a batch has both or neither, and
+// both are acquired and reclaimed at the same points.
+//
+// The request body is deliberately not in the set, though it is the third
+// per-batch allocation and reclaiming it would look like the same move. It is
+// the one buffer handed to net/http, and the transport writes a request from a
+// goroutine of its own: when the server answers before reading the body — which
+// is exactly what a 413 is — that write can still be in progress after do has
+// returned. Those bytes are not ours to hand out again.
+type batchBufs struct {
+	raw    []byte
+	bounds []int
+}
+
+func (c *Client) getBatchBufs() *batchBufs {
+	if bufs, _ := c.batchBufPool.Get().(*batchBufs); bufs != nil {
+		return bufs
+	}
+	return &batchBufs{}
+}
+
+// putBatchBufs returns a buffer set to the pool, or lets an outsized one go to
+// the collector.
+//
+// The sender checks a batch for fullness only after appending a record, so one
+// outsized record leaves that batch's raw buffer over MaxBatchBytes — and a
+// slice only ever grows. Twice the cap is the line, the same trade
+// putRecordBuf and putJSONEncoder make against their fixed ones.
+func (c *Client) putBatchBufs(bufs *batchBufs) {
+	if cap(bufs.raw) > 2*c.cfg.maxBatchBytes {
+		return
+	}
+	c.batchBufPool.Put(bufs)
+}
+
+// releaseBatch reclaims the buffers of a batch that is fully resolved — sent,
+// dropped or abandoned, with nothing left that can read raw or bounds. It must
+// be called exactly once per batch; clearing bufs makes a second call a no-op
+// rather than a double free.
+//
+// It does nothing for a batch that does not own its buffers, which is every
+// half a split produced: the half's raw is a range of the parent's, and the
+// left half's bounds are the parent's own slice.
+//
+// So a parent split by an upload worker is reclaimable and a parent split by
+// the sender is not, which looks arbitrary and is not. splitAndSend delivers
+// both halves before it returns, so by the time the worker loop reaches here
+// the aliases are gone. The sender's halves go to the pool and outlive the
+// dispatch that made them, and nothing short of a refcount could say when the
+// last of them is done with the parent's array — for a path the local
+// hard-limit check makes rare by construction.
+func (c *Client) releaseBatch(b *batch) {
+	bufs := b.bufs
+	if bufs == nil {
+		return
+	}
+	b.bufs = nil
+	c.putBatchBufs(bufs)
 }
 
 // packer turns a run of encoded records into a request body. It owns reusable

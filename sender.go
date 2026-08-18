@@ -193,17 +193,22 @@ func (s *sender) flush(ctx context.Context) {
 
 	records := s.n
 	// The batch owns its records from here on: s.buf and s.bounds are reused
-	// for the next one, and the batch keeps them for a possible split.
-	raw := append([]byte(nil), s.buf...)
-	bounds := append([]int(nil), s.bounds...)
+	// for the next one, and the batch keeps them for a possible split. The
+	// copies come from the pool and go back to it when the batch is resolved,
+	// so a steady state of same-sized batches allocates neither.
+	bufs := s.c.getBatchBufs()
+	bufs.raw = append(bufs.raw[:0], s.buf...)
+	bufs.bounds = append(bufs.bounds[:0], s.bounds...)
 	s.reset()
 
-	b, err := s.pk.pack(raw, bounds)
+	b, err := s.pk.pack(bufs.raw, bufs.bounds)
 	if err != nil {
+		s.c.putBatchBufs(bufs)
 		s.c.report(fmt.Errorf("betterstack: compressing %d record(s): %w", records, err))
 		s.c.stats.droppedRejected.Add(uint64(records))
 		return
 	}
+	b.bufs = bufs
 
 	s.dispatch(ctx, b)
 	s.maybeReportDrops()
@@ -228,6 +233,7 @@ func (s *sender) dispatch(ctx context.Context, b *batch) {
 		// One record, over the limit on its own. Nothing to split.
 		s.c.stats.droppedOversize.Add(1)
 		s.c.report(&DropError{Records: 1, Reason: DropOversize})
+		s.c.releaseBatch(b)
 		return
 	}
 
@@ -235,8 +241,13 @@ func (s *sender) dispatch(ctx context.Context, b *batch) {
 	if err != nil {
 		s.c.report(fmt.Errorf("betterstack: splitting %d record(s): %w", b.records, err))
 		s.c.stats.droppedRejected.Add(uint64(b.records))
+		// Sound even where split failed halfway: the half it did pack is
+		// discarded unreachable, so nothing is left aliasing b.
+		s.c.releaseBatch(b)
 		return
 	}
+	// b is deliberately not released: both halves alias its raw, and they
+	// outlive this call by however long their uploads take. See releaseBatch.
 	s.dispatch(ctx, left)
 	s.dispatch(ctx, right)
 }
@@ -390,7 +401,12 @@ func newUploadPool(c *Client) *uploadPool {
 				rnd: rand.New(rand.NewSource(time.Now().UnixNano() ^ seed)),
 			}
 			for b := range p.jobs {
-				p.complete(w.upload(c.workerCtx, b))
+				err := w.upload(c.workerCtx, b)
+				// Resolved, and any halves a 413 forced out of it were
+				// delivered before upload returned, so nothing aliases the
+				// batch any more.
+				c.releaseBatch(b)
+				p.complete(err)
 			}
 		}(int64(i) * 7919)
 	}
@@ -413,6 +429,7 @@ func (p *uploadPool) abandon(b *batch) {
 	} else {
 		p.c.stats.droppedBacklog.Add(uint64(b.records))
 	}
+	p.c.releaseBatch(b)
 }
 
 func (p *uploadPool) recordDispatch() {

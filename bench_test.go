@@ -380,6 +380,29 @@ func BenchmarkFlush(b *testing.B) {
 	}
 }
 
+// BenchmarkFlushBatch measures a whole batch through the flush path, which is
+// where the per-batch copies live. BenchmarkFlush's one-record batches show the
+// allocation count but not the bytes.
+func BenchmarkFlushBatch(b *testing.B) {
+	const records = 200
+	c := benchClient(b, WithBatchSize(records*2), WithBatchInterval(time.Hour))
+	ctx := context.Background()
+	ev := event(0)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < records; j++ {
+			if err := c.Enqueue(ev); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if err := c.Flush(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkSourceValue measures WithAddSource's per-record symbolization, and
 // its control: the same work with the PC cache bypassed. The gap is what the
 // cache is for, and it is smaller than the whole of WithAddSource's overhead —
