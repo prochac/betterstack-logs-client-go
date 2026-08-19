@@ -307,6 +307,16 @@ func appendFloat(dst []byte, f float64, bits int, orig any) ([]byte, error) {
 // even so, because encoding/json escapes them unconditionally and matching its
 // bytes is the contract this function is held to.
 //
+// A control character that has a short escape gets it: \b, \f, \n, \r, \t.
+// That is one of the two rules encoding/json has moved underneath this
+// function — Go 1.25 gave the v1 encoder \b and \f, where every release before
+// it wrote the six-character \u0008 and \u000c (the other is the U+FFFD escape
+// below). The short form is what a caller's own encoding/json emits on every
+// toolchain still in support, so it is the form to match; on the go.mod floor
+// the two differ in those two bytes and nowhere else, and either way it is the
+// same JSON string. FuzzAppendString allows exactly that class, by comparing
+// decoded values there and bytes everywhere else.
+//
 // Bytes are copied in runs. The loop only ever stops at a byte that needs
 // escaping or a rune that needs replacing, so the common case — a string with
 // nothing to escape — is a length check per byte and one copy.

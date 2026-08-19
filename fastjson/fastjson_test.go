@@ -143,9 +143,9 @@ func jsonSprint(v any) string {
 	return string(b)
 }
 
-// A multi-key object cannot be compared byte for byte, because this package
-// deliberately does not sort keys. Comparing the decoded values is the
-// strongest assertion available, and key order is the only thing it gives up.
+// A multi-key object is compared byte for byte, key order included: this
+// package sorts its keys for the same reason encoding/json does, and that is
+// the property the assertion below exists to hold.
 func TestAppendObjectMatchesEncodingJSON(t *testing.T) {
 	t.Parallel()
 
@@ -172,8 +172,9 @@ func TestAppendObjectMatchesEncodingJSON(t *testing.T) {
 			// library shipped a release whose records gzipped ~35% worse with
 			// nothing failing: key order is invisible to a decoder and is the
 			// whole of what the compressor sees. None of these payloads carries
-			// invalid UTF-8, which is the one class where the two legitimately
-			// differ in bytes; FuzzAppendString covers that by decoding.
+			// invalid UTF-8 or a backspace or form feed, which are the two
+			// classes where the two legitimately differ in bytes;
+			// FuzzAppendString covers both by decoding.
 			if want := mustRef(t, p); !bytes.Equal(got, want) {
 				t.Errorf("bytes differ from encoding/json:\n got %s\nwant %s", got, want)
 			}
@@ -293,13 +294,21 @@ func FuzzAppendString(f *testing.F) {
 			return
 		}
 
-		// One class of input is allowed to differ, because encoding/json
-		// differs from itself on it: for a byte that is not valid UTF-8, the
-		// pre-1.27 engine writes the six-character escape \ufffd and the v2
-		// engine (default from Go 1.27) writes the replacement character
-		// itself. Both are valid JSON for the same string, so the assertion
-		// there is on the decoded value; everywhere else it stays on the bytes.
-		if utf8.ValidString(s) {
+		// Two classes of input are allowed to differ, because encoding/json
+		// differs from itself on them across toolchains. Both are the same JSON
+		// string either way, so the assertion there is on the decoded value;
+		// everywhere else it stays on the bytes.
+		//
+		// A byte that is not valid UTF-8: the pre-1.27 engine writes the
+		// six-character escape \ufffd and the v2 engine (default from Go 1.27)
+		// writes the replacement character itself.
+		//
+		// A backspace or a form feed: Go 1.25 gave the v1 encoder the short
+		// escapes \b and \f, where every release before it wrote \u0008 and
+		// \u000c. appendString writes the short form on every toolchain, which
+		// is the form the reference agrees with from 1.25 on and differs from
+		// on the go.mod floor alone.
+		if utf8.ValidString(s) && !strings.ContainsAny(s, "\b\f") {
 			t.Errorf("appendString(%q) =\n %s\nwant %s", s, got, want)
 			return
 		}
