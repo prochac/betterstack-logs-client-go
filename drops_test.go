@@ -422,7 +422,7 @@ func (countingEncoder) AppendRecord(dst []byte, _ map[string]any) ([]byte, error
 // A framing that depends on the record count, so that a batch which is split
 // and re-framed cannot pass by accident.
 func (countingEncoder) Frame(batch []byte, n int) []byte {
-	return append(batch, []byte(fmt.Sprintf("count=%d\n", n))...)
+	return fmt.Appendf(batch, "count=%d\n", n)
 }
 
 func TestEncoderFramesEachBatch(t *testing.T) {
