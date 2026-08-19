@@ -17,7 +17,24 @@ updates:
       interval: monthly
     commit-message:
       prefix: "ci"
+    # One pull request for the whole monthly sweep. Ungrouped, the first sweep
+    # opened four — checkout, setup-go, upload-artifact, cache — all cut from
+    # the same base, so merging any one of them left the other three behind
+    # main, and each then had to rebase and re-run the full matrix for a
+    # one-line change to the same two files. Grouping is safe here because the
+    # members are interchangeable from this repository's side: CI is the only
+    # thing that consumes them, and it either passes on the group or does not.
+    # The cost is that the sweep lands as one commit naming the group rather
+    # than one per action, so a bump that breaks CI is reverted by dropping the
+    # whole month and re-bumping by hand.
+    groups:
+      actions:
+        patterns: ["*"]
 
+  # Deliberately ungrouped, unlike the actions above: the header's point is
+  # that a pull request here is read one dependency at a time. goleak is the
+  # only routine bump, and anything joining it is a design decision that wants
+  # its own thread rather than a line in a batch.
   - package-ecosystem: gomod
     directory: "/"
     schedule:
