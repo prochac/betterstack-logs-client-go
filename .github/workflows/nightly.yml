@@ -27,7 +27,7 @@ jobs:
       matrix:
         go: ["1.21.x", "stable"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
@@ -50,7 +50,7 @@ jobs:
         # One target per invocation: -fuzz takes a single function.
         target: [FuzzAppendString, FuzzAppendFloat, FuzzAppendTime]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
@@ -104,7 +104,7 @@ jobs:
     name: govulncheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
