@@ -770,6 +770,76 @@ func (e *lineEncoder) Frame(batch []byte, n int) []byte {
 
 func (e *lineEncoder) frames() int64 { return e.n.Load() }
 
+// --- the record buffer pool -------------------------------------------------
+
+// A record's encode buffer only ever grows, so one outsized record would pin
+// its capacity in the pool for the life of the client — the same slow leak
+// maxPooledJSONBuffer guards one level down, and the whole reason putRecordBuf
+// has a cap.
+//
+// The assertion is one-sided, like the batch pool's below: a pool that answers
+// with nothing passes, so this can only fail when the oversized buffer really
+// was retained.
+func TestOversizedRecordBuffersAreNotPooled(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder(t)
+	c, _ := newTestClient(t, rec)
+	defer c.Close()
+
+	buf := make([]byte, 0, 4*maxPooledRecordBuffer)
+	c.putRecordBuf(&buf)
+
+	// Drain rather than Get once: a pool holds per-P private and shared slots
+	// and nothing promises which one answers first.
+	for i := 0; i < 16; i++ {
+		p, _ := c.recordBufs.Get().(*[]byte)
+		if p == nil {
+			continue
+		}
+		if got := cap(*p); got > maxPooledRecordBuffer {
+			t.Fatalf("pooled record buffer has capacity %d, over the %d cap: "+
+				"one outsized record inflates the pool permanently",
+				got, maxPooledRecordBuffer)
+		}
+	}
+}
+
+// The sender copies each record into its accumulation buffer before returning
+// the buffer it arrived in, and that copy is the whole licence for Enqueue to
+// hand the queue a pooled *[]byte. It is invisible from outside: a sender that
+// kept the slice instead would pass every other test here, because nothing
+// writes to a record's buffer between its enqueue and its flush — until the pool
+// hands that same buffer to the next Enqueue, which is the one sequence no other
+// test constructs.
+//
+// So this one constructs it, on a bare sender rather than through a client:
+// getting the buffer back out of a sync.Pool is not something a test can rely
+// on — a Put that lands in another P's private slot is invisible to Get, so
+// waiting for it flakes.
+func TestAppendRecordCopiesOutOfTheRecordBuffer(t *testing.T) {
+	t.Parallel()
+
+	// armed, so the empty-to-non-empty transition does not reach through the nil
+	// client for the batch interval: arming is not what is under test here.
+	s := &sender{timer: newStoppedTimer(), armed: true}
+	defer s.timer.Stop()
+
+	const want = `{"message":"record-0"}`
+	rec := []byte(want)
+	s.appendRecord(rec)
+
+	// What Enqueue's next caller would do with the buffer once it is pooled.
+	for i := range rec {
+		rec[i] = 'Z'
+	}
+
+	if got := string(s.buf); got != want {
+		t.Errorf("batch holds %q after the record's buffer was reused, want %q: "+
+			"appendRecord kept the caller's slice instead of copying out of it", got, want)
+	}
+}
+
 // --- the batch buffer pool --------------------------------------------------
 
 // A batch's record buffer only ever grows, and the sender checks a batch for
