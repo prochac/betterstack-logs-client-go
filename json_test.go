@@ -169,6 +169,54 @@ func keyOrder(s string, want []string) []string {
 	return got
 }
 
+// Integers keep every digit, however large. A log line routinely carries an
+// identifier that is exact as an int64 or a uint64 and not as a float64 — a
+// snowflake id, a database row id, a nanosecond timestamp — and one that lost
+// its low bits here would look entirely plausible and be silently wrong.
+//
+// Like the sorted-key test this asserts bytes, and for a related reason: a
+// consumer decoding into map[string]any parses every JSON number into a
+// float64, so an assertion made after decoding would pass just as happily
+// against an encoder that had already rounded the value away. Only the
+// encoded digits can tell the difference.
+//
+// What holds it up is that encoding/json writes integer kinds through
+// strconv.AppendUint/AppendInt, and attr.go hands uint64 and int64 attributes
+// through as themselves (staticValue) rather than widening them. Both halves
+// are load-bearing; this fails if either is lost.
+func TestJSONLargeIntegersKeepExactDigits(t *testing.T) {
+	t.Parallel()
+
+	payload := map[string]any{
+		"max_uint64": uint64(math.MaxUint64),
+		"max_int64":  int64(math.MaxInt64),
+		"min_int64":  int64(math.MinInt64),
+		// 2^53+1, the first integer float64 cannot represent, either sign.
+		"just_past_float64":     int64(1)<<53 + 1,
+		"just_past_float64_neg": -(int64(1)<<53 + 1),
+		// A realistic id rather than a boundary value.
+		"snowflake": uint64(1234567890123456789),
+	}
+
+	b, err := appendJSONObject(nil, payload)
+	if err != nil {
+		t.Fatalf("appendJSONObject: %v", err)
+	}
+
+	for key, digits := range map[string]string{
+		"max_uint64":            "18446744073709551615",
+		"max_int64":             "9223372036854775807",
+		"min_int64":             "-9223372036854775808",
+		"just_past_float64":     "9007199254740993",
+		"just_past_float64_neg": "-9007199254740993",
+		"snowflake":             "1234567890123456789",
+	} {
+		if want := `"` + key + `":` + digits; !bytes.Contains(b, []byte(want)) {
+			t.Errorf("encoded body does not contain %s\nencoded: %s", want, b)
+		}
+	}
+}
+
 // dt is the field the ingestion API reads, as RFC 3339 with nanoseconds.
 func TestJSONTimeIsRFC3339Nano(t *testing.T) {
 	t.Parallel()
