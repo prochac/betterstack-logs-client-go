@@ -1,4 +1,5 @@
-name: Nightly
+# Named for what it proves, because that name is README's badge label.
+name: "fuzz & vuln scan"
 
 # The slow half of the checklist: the things worth running regularly but not on
 # every push. GitHub disables schedules on a repository with no activity for 60

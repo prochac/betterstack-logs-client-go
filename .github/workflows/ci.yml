@@ -1,4 +1,6 @@
-name: CI
+# The name is what README's badge reads, so it says what the workflow
+# proves rather than that it exists.
+name: "build & test"
 
 # This repository had no CI by design, so every job below is the same command
 # CLAUDE.md ("Commands") tells a human to run by hand — nothing here checks
@@ -125,6 +127,10 @@ jobs:
   coverage:
     name: coverage
     runs-on: ubuntu-latest
+    # The workflow default is read-only. This job alone needs write, and only
+    # to force-push the rendered badge onto the orphan `badges` branch below.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
 
@@ -147,12 +153,14 @@ jobs:
       # blocks are unreachable rather than untested, so this only fires when a
       # feature lands with no test at all.
       - name: Enforce floor
+        id: floor
         env:
           MINIMUM: "97.0"
         run: |
           total=$(go tool cover -func=cover.out | awk '/^total:/ {print $NF}' | tr -d '%')
           echo "total coverage: ${total}% (floor ${MINIMUM}%)"
           echo "### Coverage: ${total}%" >> "$GITHUB_STEP_SUMMARY"
+          echo "total=${total}" >> "$GITHUB_OUTPUT"
           if awk -v t="$total" -v m="$MINIMUM" 'BEGIN { exit !(t + 0 < m + 0) }'; then
             echo "::error::coverage ${total}% is below the ${MINIMUM}% floor"
             exit 1
@@ -164,6 +172,77 @@ jobs:
           path: cover.out
           if-no-files-found: error
 
+      # README's badges, rendered from what this job already knows and served
+      # by GitHub. A coverage service would report the same figure and want an
+      # account, a token and a webhook for it; this is the figure, drawn in
+      # fifteen lines of SVG. It is deliberately not a shields endpoint either
+      # — that would still put a third party between the README and its own
+      # build. The Go badge goes the same way rather than being a static image
+      # somebody has to remember to redraw: it reads go.mod, so raising the
+      # floor raises the badge in the same commit.
+      #
+      # The branch is orphaned and force-pushed, so it stays one commit holding
+      # two files and never grows. Pushing to it cannot retrigger this
+      # workflow: `on.push.branches` is main and tags only.
+      - name: Publish the badges
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOTAL: ${{ steps.floor.outputs.total }}
+        run: |
+          work=$(mktemp -d)
+
+          # One flat badge: label, message, colour, output path. Verdana at
+          # 11px runs about 7px a character, which is what sizes each half.
+          # The heredoc below is written at this block's own indentation and
+          # not the function body's, because YAML strips exactly that much —
+          # which is what leaves EOF in column zero, where sh needs it.
+          badge() {
+            lw=$(( ${#1} * 7 + 14 ))
+            mw=$(( ${#2} * 7 + 14 ))
+            w=$(( lw + mw ))
+            lx=$(( lw * 5 ))
+            mx=$(( (lw + mw / 2) * 10 ))
+            cat > "$4" <<EOF
+          <svg xmlns="http://www.w3.org/2000/svg" width="$w" height="20" role="img" aria-label="$1: $2">
+          <title>$1: $2</title>
+          <linearGradient id="s" x2="0" y2="100%"><stop offset="0" stop-color="#bbb" stop-opacity=".1"/><stop offset="1" stop-opacity=".1"/></linearGradient>
+          <clipPath id="r"><rect width="$w" height="20" rx="3" fill="#fff"/></clipPath>
+          <g clip-path="url(#r)">
+          <rect width="$lw" height="20" fill="#555"/>
+          <rect x="$lw" width="$mw" height="20" fill="$3"/>
+          <rect width="$w" height="20" fill="url(#s)"/>
+          </g>
+          <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" text-rendering="geometricPrecision" font-size="110">
+          <text transform="scale(.1)" x="$lx" y="150" fill="#010101" fill-opacity=".3">$1</text>
+          <text transform="scale(.1)" x="$lx" y="140">$1</text>
+          <text transform="scale(.1)" x="$mx" y="150" fill="#010101" fill-opacity=".3">$2</text>
+          <text transform="scale(.1)" x="$mx" y="140">$2</text>
+          </g>
+          </svg>
+          EOF
+          }
+
+          color=$(awk -v t="$TOTAL" 'BEGIN {
+            if (t + 0 >= 95) print "#4c1";
+            else if (t + 0 >= 85) print "#97ca00";
+            else if (t + 0 >= 70) print "#dfb317";
+            else print "#e05d44";
+          }')
+          badge coverage "${TOTAL}%" "$color" "$work/coverage.svg"
+
+          # The floor go.mod actually declares, not a number typed twice.
+          floor=$(awk '$1 == "go" { print $2; exit }' go.mod)
+          badge go "${floor}+" "#00ADD8" "$work/go.svg"
+
+          cd "$work"
+          git init -q -b badges
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add coverage.svg go.svg
+          git commit -qm "coverage: ${TOTAL}%, go: ${floor}+"
+          git push -q --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
   bench:
     name: bench
     runs-on: ubuntu-latest

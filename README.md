@@ -1,6 +1,10 @@
 # betterstack-logs-client-go
 
-[![CI](https://github.com/prochac/betterstack-logs-client-go/actions/workflows/ci.yml/badge.svg)](https://github.com/prochac/betterstack-logs-client-go/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/prochac/betterstack-logs-client-go.svg)](https://pkg.go.dev/github.com/prochac/betterstack-logs-client-go)
+[![build & test](https://github.com/prochac/betterstack-logs-client-go/actions/workflows/ci.yml/badge.svg)](https://github.com/prochac/betterstack-logs-client-go/actions/workflows/ci.yml)
+[![fuzz & vuln scan](https://github.com/prochac/betterstack-logs-client-go/actions/workflows/nightly.yml/badge.svg)](https://github.com/prochac/betterstack-logs-client-go/actions/workflows/nightly.yml)
+[![coverage](https://raw.githubusercontent.com/prochac/betterstack-logs-client-go/badges/coverage.svg)](https://github.com/prochac/betterstack-logs-client-go/actions/workflows/ci.yml)
+[![go](https://raw.githubusercontent.com/prochac/betterstack-logs-client-go/badges/go.svg)](./go.mod)
 
 A [Better Stack](https://betterstack.com/logs) logging client for Go: a
 `log/slog` handler backed by a batching, retrying HTTP client.
