@@ -1,0 +1,217 @@
+name: CI
+
+# This repository had no CI by design, so every job below is the same command
+# CLAUDE.md ("Commands") tells a human to run by hand — nothing here checks
+# something you cannot reproduce locally in one line.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The matrix is only meaningful if the Go it selects is the Go that runs.
+  # Left on auto, a toolchain line anywhere in the graph lets the 1.21 job
+  # download something newer and the go.mod floor stops being tested at all.
+  GOTOOLCHAIN: local
+
+jobs:
+  test:
+    name: test (go ${{ matrix.go }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # Windows would otherwise get pwsh, and the point of that job is to
+        # test this code on Windows, not to test a second shell dialect.
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The go.mod floor. It builds and tests here or the floor is a
+          # fiction; `stdversion` does not exist in this toolchain, which is
+          # why the newest one below is the job that catches a post-1.21
+          # stdlib symbol.
+          - {os: ubuntu-latest, go: "1.21.x"}
+          - {os: ubuntu-latest, go: "oldstable"}
+          # The newest toolchain is where the standard library can move
+          # underneath this code: json/v2 as the engine under the v1 API, and
+          # the timer-channel semantics sender.go documents.
+          - {os: ubuntu-latest, go: "stable"}
+          # The library is pure Go, but the suite is timing- and
+          # concurrency-shaped. Two more platforms is how that stays true
+          # somewhere other than Linux.
+          - {os: macos-latest, go: "stable"}
+          - {os: windows-latest, go: "stable"}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      - name: Build
+        run: go build ./...
+
+      # Not optional: go.mod declares go 1.21 and the compiler will happily
+      # build a newer stdlib symbol. Only vet's stdversion analyzer says no,
+      # and only on a toolchain that has it.
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+
+      # Pinned, and to the same version the .golangci.yml header is written
+      # against: a linter that updates itself turns an unrelated pull request
+      # red for a rule nobody chose to adopt yet. Dependabot cannot bump this
+      # one, so it is a deliberate manual edit.
+      - name: Install golangci-lint
+        env:
+          GOLANGCI_LINT_VERSION: v2.12.2
+        run: |
+          curl -sSfL "https://raw.githubusercontent.com/golangci/golangci-lint/${GOLANGCI_LINT_VERSION}/install.sh" |
+            sh -s -- -b "$(go env GOPATH)/bin" "${GOLANGCI_LINT_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # The config is v2 schema and hand-maintained; verify it before trusting
+      # a clean run from it.
+      - name: Verify config
+        run: golangci-lint config verify
+
+      - name: Lint
+        run: golangci-lint run ./...
+
+      # gofumpt -extra plus goimports. The repository formats clean, so any
+      # output at all is a regression — but `fmt --diff` prints the diff
+      # rather than failing, so the emptiness is what gets asserted.
+      - name: Formatting
+        run: |
+          diff=$(golangci-lint fmt --diff ./... || true)
+          if [ -n "$diff" ]; then
+            printf '%s\n' "$diff"
+            echo "::error::golangci-lint fmt reports changes; run 'golangci-lint fmt ./...'"
+            exit 1
+          fi
+
+      # go.sum drift is invisible in review and only bites the next person to
+      # run a build. The module has one test-only dependency, so this is a
+      # no-op until it is not.
+      - name: Tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+
+      # example/ is excluded deliberately. It is documentation with no tests,
+      # and including it drags the reported total from ~98.7% to ~88.7% —
+      # a number that says nothing about the library. COVERAGE.md accounts for
+      # every block the library still misses.
+      - name: Test with coverage
+        run: go test -race -coverprofile=cover.out -covermode=atomic $(go list ./... | grep -v '/example$')
+
+      - name: Report
+        run: go tool cover -func=cover.out
+
+      # A floor, not a target. Coverage sits at ~98.7% and the remaining
+      # blocks are unreachable rather than untested, so this only fires when a
+      # feature lands with no test at all.
+      - name: Enforce floor
+        env:
+          MINIMUM: "97.0"
+        run: |
+          total=$(go tool cover -func=cover.out | awk '/^total:/ {print $NF}' | tr -d '%')
+          echo "total coverage: ${total}% (floor ${MINIMUM}%)"
+          echo "### Coverage: ${total}%" >> "$GITHUB_STEP_SUMMARY"
+          if awk -v t="$total" -v m="$MINIMUM" 'BEGIN { exit !(t + 0 < m + 0) }'; then
+            echo "::error::coverage ${total}% is below the ${MINIMUM}% floor"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-profile
+          path: cover.out
+          if-no-files-found: error
+
+  bench:
+    name: bench
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+
+      # A smoke test, not a measurement: shared runners cannot produce numbers
+      # worth comparing. -benchtime 10x keeps it to seconds, and what it
+      # catches is a benchmark that stopped compiling or started panicking —
+      # which `go test ./...` never runs and so never notices.
+      - name: Run benchmarks
+        run: go test -run '^$' -bench . -benchmem -benchtime 10x ./...
+
+  unlinked:
+    name: fastjson stays unlinked
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+
+      # The whole point of fastjson being a subpackage: a binary that does not
+      # opt in must not link it (CLAUDE.md, Architecture; DESIGN §4). An
+      # accidental import in the root package is invisible in review and
+      # silently costs every user the trust argument the seam exists to avoid.
+      - name: Build the example
+        run: go build -o example.bin ./example
+
+      - name: No fastjson in the dependency graph
+        run: |
+          if go list -deps ./example | grep -q '/fastjson$'; then
+            go list -deps ./example | grep '/fastjson$'
+            echo "::error::example imports fastjson; the opt-in encoder must stay opt-in"
+            exit 1
+          fi
+
+      - name: No fastjson symbols in the binary
+        run: |
+          if go tool nm example.bin | grep -q 'fastjson'; then
+            go tool nm example.bin | grep 'fastjson' | head
+            echo "::error::fastjson symbols linked into a binary that never asked for them"
+            exit 1
+          fi

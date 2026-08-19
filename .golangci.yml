@@ -1,10 +1,15 @@
 # golangci-lint configuration.
 #
-# There is no CI (CLAUDE.md, "Repository conventions"), so this file is the
-# checklist a human runs by hand:
+# The commands this file configures, which a human runs by hand and which
+# .github/workflows/ci.yml's lint job then runs again on every push:
 #
 #     golangci-lint run ./...
 #     golangci-lint fmt ./...
+#
+# CI pins the version it installs (v2.12.2 today, the version this file's
+# comments are written against). Bumping it there is a deliberate edit, because
+# a linter that updates itself turns an unrelated pull request red for a rule
+# nobody chose to adopt yet.
 #
 # There used to be a blind spot — a build-tagged json_v2.go this run could not
 # compile. That file is gone (DESIGN §4), so `./...` now lints every line the

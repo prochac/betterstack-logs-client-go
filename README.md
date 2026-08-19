@@ -1,5 +1,7 @@
 # betterstack-logs-client-go
 
+[![CI](https://github.com/prochac/betterstack-logs-client-go/actions/workflows/ci.yml/badge.svg)](https://github.com/prochac/betterstack-logs-client-go/actions/workflows/ci.yml)
+
 A [Better Stack](https://betterstack.com/logs) logging client for Go: a
 `log/slog` handler backed by a batching, retrying HTTP client.
 

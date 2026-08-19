@@ -48,7 +48,12 @@ go test -race -count=5 ./...       # flake check; timing tests must survive this
 go test -race -coverprofile=cover.out ./... && go tool cover -func=cover.out
 go test -run '^$' -bench . -benchmem -benchtime 2s ./...
 go test -race -run TestSlogtest ./...   # handler conformance alone
+go test -run '^$' -fuzz '^FuzzAppendTime$' -fuzztime 5m ./fastjson   # one target per run
 ```
+
+CI runs these, and only these — see "Repository conventions" for which job runs
+what. The nightly workflow carries the two that are too slow for a push: the
+`-count=5` flake check and the three `fastjson` fuzz targets.
 
 Plus `golangci-lint`, configured by `.golangci.yml` (golangci-lint v2 schema; `golangci-lint config verify` checks it). The repository lints and formats clean, so any output is a regression:
 
@@ -125,7 +130,7 @@ The greenfield rewrite only buys clean licensing if no source is copied. `samber
 ## Repository conventions
 
 - **The exported API is not frozen**, but it is close to it. This is a new module with its own v0, so breaking changes are cheap now and expensive after the first tag. Decide API shape before tagging v0.1.
-- No CI and no Makefile — a deliberate scope choice, not an oversight. `.golangci.yml` is therefore a checklist a human runs, not a gate something enforces.
+- **There is no Makefile** — a deliberate scope choice. CI is GitHub Actions and nothing else: `.github/workflows/ci.yml` on every push and pull request, `.github/workflows/nightly.yml` on a schedule. Every job runs a command from "Commands" above verbatim, so anything CI can tell you, you can reproduce locally in one line; keep it that way rather than adding CI-only tooling. `GOTOOLCHAIN: local` is set workflow-wide, or the `1.21.x` matrix entry would quietly download something newer and the floor would stop being tested. Three jobs assert things no local `go test` does: coverage against a 97% floor computed with `example/` excluded (including it reports ~88.7% and says nothing about the library), the benchmarks compiling and running at all (`go test ./...` never runs them), and `fastjson` staying absent from `go list -deps ./example` and from `go tool nm` on its binary. The lint version is pinned in the workflow and Dependabot is told not to touch it.
 - **Suppress in the config, not at the site.** `nolintlint` runs with `require-explanation`, `require-specific` and `allow-unused: false`, but the stronger rule is upstream of it: if a check can only ever be answered with a suppression, turn the check off once in `.golangci.yml` with the reason, rather than repeating it at every hit. Two `gocritic` checks are off for exactly that (`hugeParam`, `exitAfterDefer`), as is `gosec`'s G115. That leaves two `//nolint`s in the whole tree — the retry jitter's `math/rand`, and the `Flush(nil)` one test exists to check — and both mark something genuinely local.
 - **`gocritic`'s `appendAssign` is enabled, and `attr.go` must keep it satisfied.** It fired on the group-path `append(groups, key)` and was right to: two sibling groups nested in a third borrow the same spare slot in the parent's array, so a `ReplaceAttr` that keeps the slice it was handed sees its path rewritten. `slog.JSONHandler` has the same edge — its group stack is pooled, pushed and popped — and fails the test below, so this is a guarantee *stronger* than the standard library's, not a bug fix. Both sites go through `childPath`, an exact-size copy like `withGroupOrAttrs`, which benchmarks as no change at all. `TestReplaceAttr/the_group_path_is_not_shared_between_siblings` holds it; it has been verified to fail against a plain `append`, and note that the *shape* matters — one nested group does not reproduce it, because nothing overwrites the slot afterwards.
 - **`example/` is `package main` inside this module**, so `go build ./...` and `go vet ./...` cover it and it cannot rot. It therefore lives under the same Go 1.21 floor as the library: no `for range int`, no method patterns in `http.ServeMux` (`"GET /x"` is 1.22), nothing else `stdversion` would catch.

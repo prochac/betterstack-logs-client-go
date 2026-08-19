@@ -1,0 +1,26 @@
+# Dependabot keeps the two things this repository pins from going stale on their
+# own. Neither can be bumped by `go get`:
+#
+#   - the action versions in .github/workflows, which nothing else watches;
+#   - go.mod, which today is one test-only dependency (goleak) and is meant to
+#     stay that way — a pull request here adding a production dependency is a
+#     design change, not a routine update.
+#
+# golangci-lint is deliberately absent: its version is pinned in ci.yml as a
+# plain string, because adopting new rules is an edit to .golangci.yml and its
+# comments, not a version bump.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "deps"

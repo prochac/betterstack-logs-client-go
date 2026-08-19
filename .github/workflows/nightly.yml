@@ -1,0 +1,125 @@
+name: Nightly
+
+# The slow half of the checklist: the things worth running regularly but not on
+# every push. GitHub disables schedules on a repository with no activity for 60
+# days, so treat a silent nightly as "re-enable me", not as "green".
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  stress:
+    name: stress (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.21.x", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      # The suite's own flake check (CLAUDE.md, "Commands"). Every timing
+      # assertion in it is a one-sided lower bound precisely so this survives;
+      # a failure here is a real race or a wait that crept back in, not noise
+      # to be re-run away.
+      - name: Repeat the suite
+        run: go test -race -count=5 ./...
+
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # One target per invocation: -fuzz takes a single function.
+        target: [FuzzAppendString, FuzzAppendFloat, FuzzAppendTime]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+
+      # Go keeps the inputs a run found interesting under GOCACHE/fuzz, and
+      # that is the entire product of a night that found no crasher: a corpus
+      # that has already climbed to the branches this target can reach. Ask for
+      # it by path rather than hardcoding ~/.cache/go-build, and create it now
+      # so the save step below has something to look at even if the run dies.
+      - name: Locate the fuzz corpus
+        id: corpus
+        run: |
+          dir="$(go env GOCACHE)/fuzz"
+          mkdir -p "$dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      # The key is deliberately unique per run. A cache entry is immutable, so
+      # a stable key would restore last night's corpus, refuse to save the
+      # grown one, and leave every run starting from the same shallow point —
+      # which is the failure mode this whole step exists to avoid. The prefix
+      # in restore-keys is what makes tonight resume from the newest entry.
+      - name: Restore the fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.corpus.outputs.dir }}
+          key: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-${{ matrix.target }}-
+
+      # fastjson's fuzzing is differential — it compares the appender against
+      # encoding/json byte for byte, which is the only thing that can catch a
+      # hand-written encoder disagreeing with the standard library on an input
+      # nobody thought to write a case for. Five minutes a night is only worth
+      # more than five minutes once, because the corpus above carries forward.
+      - name: Fuzz
+        run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 5m ./fastjson
+
+      # A crasher is written into the package's testdata rather than the
+      # cache, because it is a regression seed: download it, commit it, and
+      # `go test ./...` replays it on every push from then on.
+      - name: Save the failing seed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fastjson/testdata
+          if-no-files-found: ignore
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+
+      # The module has one dependency and it is test-only, so in practice this
+      # reports on the standard library the code is built against — which is
+      # the half that actually ships inside every user's binary.
+      - name: Install govulncheck
+        # Built from a module whose own floor moves; this is the one place the
+        # pinned-toolchain rule has to give way.
+        env:
+          GOTOOLCHAIN: auto
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Scan
+        run: govulncheck ./...
