@@ -392,7 +392,8 @@ func TestCloseWithSlowServerRespectsShutdownTimeout(t *testing.T) {
 	rec := newRecorder(t, withGate())
 	defer rec.release()
 
-	c, _ := newTestClient(t, rec,
+	c, _ := newTestClient(
+		t, rec,
 		WithBatchSize(1000),
 		WithShutdownTimeout(100*time.Millisecond),
 	)
@@ -472,7 +473,8 @@ func TestQueueFullDropsWithoutBlocking(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t, withGate())
-	c, _ := newTestClient(t, rec,
+	c, _ := newTestClient(
+		t, rec,
 		WithMaxQueueSize(4),
 		WithBatchSize(2),
 		WithMaxInFlight(1),
@@ -518,7 +520,8 @@ func TestQueueFullDropSkipsTheEncode(t *testing.T) {
 	rec := newRecorder(t, withGate())
 	defer rec.release() // before the server's cleanup, and after Close below
 	enc := &tallyEncoder{Encoder: NDJSON()}
-	c, _ := newTestClient(t, rec,
+	c, _ := newTestClient(
+		t, rec,
 		WithEncoder(enc),
 		WithBatchSize(1),
 		WithMaxInFlight(1),
@@ -581,7 +584,8 @@ func TestQueueFullDropAfterTheEncode(t *testing.T) {
 	rec := newRecorder(t, withGate())
 	defer rec.release() // before the server's cleanup, and after Close below
 	enc := &gateEncoder{Encoder: NDJSON(), entered: make(chan struct{}, 2), release: make(chan struct{})}
-	c, _ := newTestClient(t, rec,
+	c, _ := newTestClient(
+		t, rec,
 		WithEncoder(enc),
 		WithBatchSize(1),
 		WithMaxInFlight(1),
@@ -884,7 +888,8 @@ func TestBurstProtectionDropsOverTheLimit(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t)
-	c, _ := newTestClient(t, rec,
+	c, _ := newTestClient(
+		t, rec,
 		WithBatchSize(5),
 		WithBurstProtection(10, time.Hour),
 	)
@@ -983,7 +988,8 @@ func TestStatsBalance(t *testing.T) {
 	t.Run("retry exhaustion", func(t *testing.T) {
 		t.Parallel()
 		rec := newRecorder(t, withStatuses(503, 503, 503))
-		c, _ := newTestClient(t, rec,
+		c, _ := newTestClient(
+			t, rec,
 			WithBatchSize(1000),
 			WithMaxRetries(2),
 			WithRetryBackoff(time.Millisecond),
@@ -1029,7 +1035,8 @@ func TestStatsBalance(t *testing.T) {
 	t.Run("under stall and overflow", func(t *testing.T) {
 		t.Parallel()
 		rec := newRecorder(t, withGate())
-		c, _ := newTestClient(t, rec,
+		c, _ := newTestClient(
+			t, rec,
 			WithMaxQueueSize(8),
 			WithBatchSize(4),
 			WithMaxInFlight(1),
@@ -1046,7 +1053,8 @@ func TestStatsBalance(t *testing.T) {
 	t.Run("under burst protection", func(t *testing.T) {
 		t.Parallel()
 		rec := newRecorder(t)
-		c, _ := newTestClient(t, rec,
+		c, _ := newTestClient(
+			t, rec,
 			WithBatchSize(10),
 			WithBurstProtection(10, time.Hour),
 		)
@@ -1313,7 +1321,8 @@ func TestOnErrorPanicDoesNotKillTheClient(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t, withStatuses(401))
-	c, err := NewClient(testToken,
+	c, err := NewClient(
+		testToken,
 		WithEndpoint(rec.endpoint()),
 		WithBatchInterval(time.Hour),
 		WithBatchSize(1000),

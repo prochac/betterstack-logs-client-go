@@ -59,7 +59,7 @@ Plus `golangci-lint`, configured by `.golangci.yml` (golangci-lint v2 schema; `g
 
 ```sh
 golangci-lint run ./...
-golangci-lint fmt --diff ./...          # gofumpt -extra plus goimports; empty output
+golangci-lint fmt --diff ./...          # gofumpt (+group-params) plus goimports; empty output
 ```
 
 Read the header of `.golangci.yml` before adding a linter or an exclusion: it records why `gosec`'s G115 is off wholesale, why `goconst` ignores tests, and the two blind spots the run has.

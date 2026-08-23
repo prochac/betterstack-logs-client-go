@@ -134,7 +134,8 @@ func TestDropSummariesArriveWhileTheSenderIsWedged(t *testing.T) {
 
 	rec := newRecorder(t, withGate())
 	defer rec.release() // before the server's cleanup, and after Close below
-	c, errs := newTestClient(t, rec,
+	c, errs := newTestClient(
+		t, rec,
 		WithBatchSize(1),
 		WithMaxInFlight(1),
 		WithMaxQueueSize(4),
@@ -170,7 +171,8 @@ func TestDropSummariesArriveWhileTheSenderIsIdle(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t)
-	c, errs := newTestClient(t, rec,
+	c, errs := newTestClient(
+		t, rec,
 		WithBatchSize(1000),               // no flush trigger can fire
 		WithBurstProtection(1, time.Hour), // one record admitted, the rest refused
 		withDropReportInterval(20*time.Millisecond),
@@ -189,7 +191,8 @@ func TestCloseReportsFinalDropSummary(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t, withGate())
-	c, errs := newTestClient(t, rec,
+	c, errs := newTestClient(
+		t, rec,
 		WithMaxQueueSize(2),
 		WithBatchSize(1),
 		WithMaxInFlight(1),
@@ -225,7 +228,8 @@ func TestBurstDropsAreSummarised(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t)
-	c, errs := newTestClient(t, rec,
+	c, errs := newTestClient(
+		t, rec,
 		WithBatchSize(1000),
 		WithBurstProtection(4, time.Hour),
 	)
@@ -283,7 +287,8 @@ func TestShutdownCasualtiesAreCountedClosed(t *testing.T) {
 	// for ten seconds inside a hundred-millisecond shutdown: the cancellation
 	// lands in the backoff sleep every time.
 	rec := newRecorder(t, withStatuses(429), withResponseHeader("Retry-After", "10"))
-	c, errs := newTestClient(t, rec,
+	c, errs := newTestClient(
+		t, rec,
 		WithBatchSize(1),
 		WithMaxInFlight(1),
 		WithRetryCeiling(time.Minute), // long enough that the wait is taken
@@ -334,7 +339,8 @@ func TestFlushTimeoutIsCountedBacklog(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t, withGate())
-	c, _ := newTestClient(t, rec,
+	c, _ := newTestClient(
+		t, rec,
 		WithBatchSize(1000), // nothing dispatches except through a Flush
 		WithMaxInFlight(1),
 	)
@@ -509,7 +515,8 @@ func TestOversizeBatchIsSplitBeforeSending(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t)
-	c, errs := newTestClient(t, rec,
+	c, errs := newTestClient(
+		t, rec,
 		WithBatchSize(4),
 		WithCompression(CompressionNone), // so the body size is predictable
 		WithMaxBatchBytes(hardMaxRequestBytes*4),
@@ -561,7 +568,8 @@ func TestOversizeRecordIsDroppedBeforeSending(t *testing.T) {
 
 	enc := JSONArray() // frames a one-record batch to exactly one byte more
 	rec := newRecorder(t)
-	c, errs := newTestClient(t, rec,
+	c, errs := newTestClient(
+		t, rec,
 		WithBatchSize(1),
 		WithEncoder(enc),
 		WithCompression(CompressionNone), // so the body size is predictable
@@ -615,7 +623,8 @@ func TestOversizeRecordIsRefusedAtEnqueue(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t)
-	c, errs := newTestClient(t, rec,
+	c, errs := newTestClient(
+		t, rec,
 		WithBatchSize(1000), // so nothing here would flush on its own
 		WithCompression(CompressionNone),
 		withDropReportInterval(20*time.Millisecond),
@@ -737,7 +746,8 @@ func TestRetryCeilingCutsRetriesShort(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t, withStatuses(503, 503, 503, 503, 503, 503, 503, 503, 503, 503))
-	c, _ := newTestClient(t, rec,
+	c, _ := newTestClient(
+		t, rec,
 		WithBatchSize(1000),
 		WithMaxRetries(100),
 		WithRetryBackoff(50*time.Millisecond),
@@ -768,11 +778,13 @@ func TestRetryCeilingCutsRetriesShort(t *testing.T) {
 func TestRetryAfterBeyondCeilingGivesUpAtOnce(t *testing.T) {
 	t.Parallel()
 
-	rec := newRecorder(t,
+	rec := newRecorder(
+		t,
 		withStatuses(429),
 		withResponseHeader("Retry-After", "1"),
 	)
-	c, errs := newTestClient(t, rec,
+	c, errs := newTestClient(
+		t, rec,
 		WithBatchSize(1000),
 		WithRetryBackoff(time.Millisecond), // irrelevant: Retry-After overrides it
 		WithRetryCeiling(200*time.Millisecond),

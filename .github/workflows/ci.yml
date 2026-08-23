@@ -90,7 +90,7 @@ jobs:
       # one, so it is a deliberate manual edit.
       - name: Install golangci-lint
         env:
-          GOLANGCI_LINT_VERSION: v2.12.2
+          GOLANGCI_LINT_VERSION: v2.13.1
         run: |
           curl -sSfL "https://raw.githubusercontent.com/golangci/golangci-lint/${GOLANGCI_LINT_VERSION}/install.sh" |
             sh -s -- -b "$(go env GOPATH)/bin" "${GOLANGCI_LINT_VERSION}"
@@ -104,9 +104,10 @@ jobs:
       - name: Lint
         run: golangci-lint run ./...
 
-      # gofumpt -extra plus goimports. The repository formats clean, so any
-      # output at all is a regression — but `fmt --diff` prints the diff
-      # rather than failing, so the emptiness is what gets asserted.
+      # gofumpt with its group-params extra, plus goimports. The repository
+      # formats clean, so any output at all is a regression — but `fmt --diff`
+      # prints the diff rather than failing, so the emptiness is what gets
+      # asserted.
       - name: Formatting
         run: |
           diff=$(golangci-lint fmt --diff ./... || true)

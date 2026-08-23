@@ -204,7 +204,8 @@ func newClient() (*betterstack.Client, error) {
 }
 
 func newHandler(client *betterstack.Client) slog.Handler {
-	return betterstack.NewHandler(client,
+	return betterstack.NewHandler(
+		client,
 		betterstack.WithLevel(slog.LevelInfo),
 		betterstack.WithAddSource(true),
 
@@ -279,7 +280,8 @@ func routes() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// InfoContext, not Info: the request ID is in the context and only the
 		// context-carrying variants pass it to the handler.
-		slog.InfoContext(r.Context(), "request served",
+		slog.InfoContext(
+			r.Context(), "request served",
 			"path", r.URL.Path,
 			"method", r.Method,
 		)
@@ -298,7 +300,8 @@ func routes() http.Handler {
 		err := errors.New("connection refused")
 		// An error value is expanded to {message, type} rather than flattened
 		// to a string, so it stays queryable at the far end.
-		slog.ErrorContext(r.Context(), "upstream call failed",
+		slog.ErrorContext(
+			r.Context(), "upstream call failed",
 			"path", r.URL.Path,
 			"err", err,
 		)

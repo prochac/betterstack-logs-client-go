@@ -276,7 +276,8 @@ func TestExtraFieldsYieldToRealAttrs(t *testing.T) {
 	t.Parallel()
 
 	sink := &stubSink{}
-	h := newHandler(sink,
+	h := newHandler(
+		sink,
 		// "service" and "env" are hoisted ahead of the records that carry them;
 		// "boom" cannot be, since an error becomes a map that the payload's
 		// owner may rewrite. Both halves of the split obey the same precedence,
@@ -306,7 +307,8 @@ func TestWithExtraFieldsEmptyIsANoOp(t *testing.T) {
 	t.Parallel()
 
 	sink := &stubSink{}
-	logger := slog.New(newHandler(sink,
+	logger := slog.New(newHandler(
+		sink,
 		WithExtraFields(map[string]any{"env": "prod"}),
 		WithExtraFields(nil),
 		WithExtraFields(map[string]any{}),
@@ -378,7 +380,8 @@ func TestExtraFieldsFlattenWithEmptyContextKey(t *testing.T) {
 	t.Parallel()
 
 	sink := &stubSink{}
-	h := newHandler(sink,
+	h := newHandler(
+		sink,
 		WithContextKey(""),
 		WithExtraFields(map[string]any{"service": "checkout"}),
 	)
@@ -694,7 +697,8 @@ func TestAddSource(t *testing.T) {
 	t.Run("beats a context extractor and an extra field", func(t *testing.T) {
 		t.Parallel()
 		sink := &stubSink{}
-		h := newHandler(sink,
+		h := newHandler(
+			sink,
 			WithAddSource(true),
 			WithAttrFromContext(func(context.Context) []slog.Attr {
 				return []slog.Attr{slog.String(slog.SourceKey, "from-context")}

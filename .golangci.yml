@@ -6,7 +6,7 @@
 #     golangci-lint run ./...
 #     golangci-lint fmt ./...
 #
-# CI pins the version it installs (v2.12.2 today, the version this file's
+# CI pins the version it installs (v2.13.1 today, the version this file's
 # comments are written against). Bumping it there is a deliberate edit, because
 # a linter that updates itself turns an unrelated pull request red for a rule
 # nobody chose to adopt yet.
@@ -14,7 +14,8 @@
 # There used to be a blind spot — a build-tagged json_v2.go this run could not
 # compile. That file is gone (DESIGN §4), so `./...` now lints every line the
 # library ships. Reintroducing a build tag would reintroduce the blind spot,
-# since v2.12 is built with go1.26 and its go/types panics on a 1.27 stdlib.
+# since the run's go/types is the one the linter was built against — v2.13 is
+# built with go1.27, and that binary panics on a stdlib newer than itself.
 version: "2"
 
 # Report everything. The defaults cap a linter at 50 issues and the same issue
@@ -198,7 +199,19 @@ formatters:
     - goimports
   settings:
     gofumpt:
-      extra-rules: true
+      # gofumpt's -extra was one rule and is now three, each its own opt-in.
+      # group-params is exactly what the old extra-rules meant, so it is the
+      # only one carried over. clothe-returns (naked returns in a function
+      # with named results) and balance-calls (a multi-line call's closing
+      # paren on its own line) are both no-ops on this tree today, and stay
+      # off until someone chooses them rather than inherits them from a bump.
+      extra:
+        group-params: true
+      # The tree is formatted by a gofumpt newer than the v0.11.0 this
+      # golangci-lint bundles: the newer one splits the first arguments of a
+      # multi-line call onto their own line, by default rather than as an
+      # extra. v0.11.0 leaves that shape alone, so the two agree and this job
+      # stays green until the bundled version catches up.
     goimports:
       local-prefixes:
         - github.com/prochac/betterstack-logs-client-go

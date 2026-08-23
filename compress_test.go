@@ -136,7 +136,8 @@ func TestFlushPackFailureReturnsBuffers(t *testing.T) {
 	t.Parallel()
 
 	errs := &errorSink{}
-	c, err := NewClient(testToken,
+	c, err := NewClient(
+		testToken,
 		WithDryRun(true), // no server: nothing here ever reaches a request
 		WithBatchInterval(time.Hour),
 		WithOnError(errs.add),
@@ -205,7 +206,8 @@ func TestPackFailureIsReportedAndCounted(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t)
-	c, errs := newTestClient(t, rec,
+	c, errs := newTestClient(
+		t, rec,
 		WithBatchSize(2),
 		withFailingCompression(0),
 	)
@@ -248,7 +250,8 @@ func TestSplitFailureIsReportedAndCounted(t *testing.T) {
 			t.Parallel()
 
 			rec := newRecorder(t)
-			c, errs := newTestClient(t, rec,
+			c, errs := newTestClient(
+				t, rec,
 				WithBatchSize(2),
 				withHardMaxBytes(1), // every body is over the limit, so every batch splits
 				withFailingCompression(tt.failFrom),
@@ -280,7 +283,8 @@ func TestSplitFailureAfter413IsReportedAndCounted(t *testing.T) {
 
 	// 1 byte accepted, so the first request is a 413 whatever it contains.
 	rec := newRecorder(t, withMaxAcceptedBytes(1))
-	c, errs := newTestClient(t, rec,
+	c, errs := newTestClient(
+		t, rec,
 		WithBatchSize(2),
 		WithMaxInFlight(1), // one worker, so one packer builds after the 413
 		// The sender's own pack is compression 0 and must succeed, or the batch

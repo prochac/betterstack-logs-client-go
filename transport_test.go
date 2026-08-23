@@ -208,7 +208,8 @@ func TestRetryThenSuccess(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t, withStatuses(500, 502, 503))
-	c, _ := newTestClient(t, rec,
+	c, _ := newTestClient(
+		t, rec,
 		WithBatchSize(1000),
 		WithRetryBackoff(time.Millisecond),
 	)
@@ -251,7 +252,8 @@ func TestTerminalStatusesAreNotRetried(t *testing.T) {
 			t.Parallel()
 
 			rec := newRecorder(t, withStatuses(status, status, status, status, status, status, status))
-			c, errs := newTestClient(t, rec,
+			c, errs := newTestClient(
+				t, rec,
 				WithBatchSize(1000),
 				WithRetryBackoff(time.Millisecond),
 			)
@@ -440,7 +442,8 @@ func TestPayloadTooLargeSplitsWithJSONArray(t *testing.T) {
 			}
 
 			rec := newRecorder(t, withMaxAcceptedBytes(len(probe)*3))
-			c, errs := newTestClient(t, rec,
+			c, errs := newTestClient(
+				t, rec,
 				WithBatchSize(1000),
 				WithEncoder(JSONArray()),
 				WithCompression(comp.opt),
@@ -552,7 +555,8 @@ func TestRetryExhaustion(t *testing.T) {
 
 	// Always fails: more scripted failures than the client will ever attempt.
 	rec := newRecorder(t, withStatuses(503, 503, 503, 503, 503, 503, 503, 503))
-	c, errs := newTestClient(t, rec,
+	c, errs := newTestClient(
+		t, rec,
 		WithBatchSize(1000),
 		WithMaxRetries(3),
 		WithRetryBackoff(time.Millisecond),
@@ -599,11 +603,13 @@ func TestMaxRetriesZero(t *testing.T) {
 func TestRetryAfterIsHonoured(t *testing.T) {
 	t.Parallel()
 
-	rec := newRecorder(t,
+	rec := newRecorder(
+		t,
 		withStatuses(429),
 		withResponseHeader("Retry-After", "1"),
 	)
-	c, _ := newTestClient(t, rec,
+	c, _ := newTestClient(
+		t, rec,
 		WithBatchSize(1000),
 		WithRetryBackoff(time.Millisecond), // would be far faster without the header
 	)
@@ -634,7 +640,8 @@ func TestNetworkErrorIsRetried(t *testing.T) {
 	c, errs := func() (*Client, *errorSink) {
 		errs := &errorSink{}
 		// A port nothing is listening on.
-		cl, err := NewClient(testToken,
+		cl, err := NewClient(
+			testToken,
 			WithEndpoint("http://127.0.0.1:1"),
 			WithBatchInterval(time.Hour),
 			WithBatchSize(1000),
@@ -767,7 +774,8 @@ func TestConnectionReuseAcrossErrors(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t, withStatuses(500, 500))
-	c, _ := newTestClient(t, rec,
+	c, _ := newTestClient(
+		t, rec,
 		WithBatchSize(1000),
 		WithMaxInFlight(1),
 		WithRetryBackoff(time.Millisecond),
@@ -819,7 +827,8 @@ func TestWithHTTPClientIsNotOwned(t *testing.T) {
 
 	rec := newRecorder(t)
 	hc := &http.Client{}
-	c, err := NewClient(testToken,
+	c, err := NewClient(
+		testToken,
 		WithEndpoint(rec.endpoint()),
 		WithBatchInterval(time.Hour),
 		WithBatchSize(1000),
@@ -848,7 +857,8 @@ func TestShutdownCancelsInFlightUploads(t *testing.T) {
 	t.Parallel()
 
 	rec := newRecorder(t, withDelay(10*time.Second))
-	c, _ := newTestClient(t, rec,
+	c, _ := newTestClient(
+		t, rec,
 		WithBatchSize(1000),
 		WithTimeout(30*time.Second),
 		WithShutdownTimeout(150*time.Millisecond),
@@ -951,7 +961,8 @@ func TestPrebuiltHeadersAreNotWrittenIntoByMiddleware(t *testing.T) {
 	const uploads = 3
 	rec := newRecorder(t)
 	hc := &http.Client{Transport: adder{http.DefaultTransport}}
-	c, err := NewClient(testToken,
+	c, err := NewClient(
+		testToken,
 		WithEndpoint(rec.endpoint()),
 		WithBatchInterval(time.Hour),
 		WithBatchSize(1),

@@ -136,7 +136,8 @@ func TestValueKinds(t *testing.T) {
 
 	when := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	payload := logRecord(t, nil, func(l *slog.Logger) {
-		l.Info("msg",
+		l.Info(
+			"msg",
 			slog.String("s", "str"),
 			slog.Int64("i", -7),
 			slog.Uint64("u", 7),
@@ -308,7 +309,8 @@ func TestReplaceAttr(t *testing.T) {
 		})}
 
 		logRecord(t, opts, func(l *slog.Logger) {
-			l.WithGroup("w1").WithGroup("w2").Info("msg", slog.Group("g",
+			l.WithGroup("w1").WithGroup("w2").Info("msg", slog.Group(
+				"g",
 				slog.Group("n1", slog.Int("k", 1)),
 				slog.Group("n2", slog.Int("k", 2)),
 				slog.Group("n3", slog.Int("k", 3)),
