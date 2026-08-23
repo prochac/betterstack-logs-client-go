@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="77" height="20" role="img" aria-label="go: 1.21+">
+<title>go: 1.21+</title>
+<linearGradient id="s" x2="0" y2="100%"><stop offset="0" stop-color="#bbb" stop-opacity=".1"/><stop offset="1" stop-opacity=".1"/></linearGradient>
+<clipPath id="r"><rect width="77" height="20" rx="3" fill="#fff"/></clipPath>
+<g clip-path="url(#r)">
+<rect width="28" height="20" fill="#555"/>
+<rect x="28" width="49" height="20" fill="#00ADD8"/>
+<rect width="77" height="20" fill="url(#s)"/>
+</g>
+<g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" text-rendering="geometricPrecision" font-size="110">
+<text transform="scale(.1)" x="140" y="150" fill="#010101" fill-opacity=".3">go</text>
+<text transform="scale(.1)" x="140" y="140">go</text>
+<text transform="scale(.1)" x="520" y="150" fill="#010101" fill-opacity=".3">1.21+</text>
+<text transform="scale(.1)" x="520" y="140">1.21+</text>
+</g>
+</svg>
